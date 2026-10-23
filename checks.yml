@@ -1,0 +1,21 @@
+name: Checks
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  production-tracker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Show runner runtimes
+        run: |
+          python3 --version
+          node --version
+      - name: Backend, keyboard, and live workflow checks
+        run: python3 run_checks.py

@@ -1,0 +1,25 @@
+# Paid web service + persistent disk. Review Render billing before deploying.
+services:
+  - type: web
+    name: trailmix-production-desk
+    runtime: python
+    plan: 0.5c-512mb
+    region: oregon
+    numInstances: 1
+    buildCommand: python -m py_compile server.py
+    startCommand: python -u server.py
+    healthCheckPath: /
+    autoDeployTrigger: "off"
+    disk:
+      name: trailmix-records
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: TRAILMIX_DB
+        value: /var/data/trailmix.sqlite3
+      - key: TRAILMIX_HTTPS
+        value: "1"
+      - key: TRAILMIX_ACCESS_CODE
+        sync: false
+      - key: TRAILMIX_SAFETY_PIN
+        sync: false

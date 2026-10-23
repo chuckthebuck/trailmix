@@ -1,0 +1,21 @@
+# Runtime data and backups stay off GitHub.
+data/
+backups/
+exports/
+*.sqlite*
+*.db
+*.db-*
+*.zip
+*.bak
+# Local secrets and Python environments.
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+# Editor/OS files.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
