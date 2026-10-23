@@ -1,72 +1,119 @@
-REMOTE HOSTING: GITHUB + RENDER
+FREE REMOTE HOSTING: GITHUB + RENDER FREE + TURSO FREE
 
-Every station and projector opens the same HTTPS address. Devices need Internet
-access to that address; they do not need to reach each other on campus Wi-Fi.
-GitHub stores the code. Render runs the Python server and stores the database.
-GitHub Pages alone cannot run this Python backend or shared SQLite database.
+GitHub holds the source. Render Free runs the app. Turso Free libSQL holds the
+production records. Every station uses one Render HTTPS URL. No paid disk is
+needed and no data is stored on Render's temporary local filesystem.
+No accounts or live deployments have been created by this package.
 
-This package prepares deployment; no live service or paid account was created.
+1. CREATE A TURSO LIBSQL DATABASE
+Sign up at https://app.turso.tech on the Free plan. Create a database named
+trailmix using the libSQL engine, which supports the SQLite tables and audit
+triggers in this app. Do not select the newer Turso engine for this release.
+Copy the database URL (libsql://... or https://...) and generate a read/write
+DATABASE token. A Turso account-management API token is not the database token.
+Keep the token private. Never upload it to GitHub or send it to station browsers.
+The app creates its tables automatically on first startup.
 
-SETUP
-1. Create a GitHub repository (private is fine). Upload the CONTENTS of this
-   folder into its root: render.yaml, server.py, trailmix.html, and the other
-   supplied code/docs. Do not upload real database files, data/, or secrets.
-2. Sign in to https://dashboard.render.com and choose New > Blueprint.
-   Connect your GitHub repository and use render.yaml at the repository root.
-3. Review the paid web service and 1 GB disk charges shown before deploying.
-   This config uses plan 0.5c-512mb (formerly Starter). Free web services do not
-   support the persistent disk required by this app. See current pricing:
-   https://render.com/pricing
-4. Enter a long, private TRAILMIX_ACCESS_CODE and a separate
-   TRAILMIX_SAFETY_PIN when Render prompts. Share only the team code with
-   operators; keep the Safety PIN with Safety personnel. Store these values in
-   Render's environment settings, never in the repository.
-5. Deploy. Open the HTTPS URL Render provides, enter the team code, then your
-   name. Use that same URL on every station and projector.
-6. Connect each browser once. In Devices, give it a useful name and assign its
-   person and station. Browser profiles have separate identities; tabs in the
-   same profile share one. This does not scan the campus network.
-7. Practice with two devices: record a label/fill operation, confirm the other
-   device updates, export logs, restart the service, reconnect, and confirm
-   records remain. Test campus access before the production session.
+If using the Turso CLI, after installation and login:
+  turso db create trailmix
+  turso db show trailmix --url
+  turso db tokens create trailmix
+Omit --tursodb: that flag selects the newer engine instead of libSQL.
+Windows CLI installation instructions use WSL; the dashboard avoids installing
+CLI tools on station devices. See https://docs.turso.tech/quickstart
 
-STORAGE AND UPDATES
-The persistent disk is mounted at /var/data. TRAILMIX_DB points to
-/var/data/trailmix.sqlite3. Keep a SINGLE service instance: SQLite and the live
-update notifications run together on that instance. Disk data persists across
-normal deploys/restarts; deleting the disk deletes its records.
+2. UPLOAD THE APP TO GITHUB
+Extract the ZIP. Upload the CONTENTS of trailmix-production-desk to the root of
+an empty repository, including .github, .gitignore, server.py, turso_db.py,
+trailmix.html, render.yaml, and the supplied documentation/tests.
+Do not upload the ZIP itself, operational databases, exports, backups or secrets.
+The repository can be private. GitHub Actions checks the code; it does not host
+or store production records.
 
-Automatic application deploys are disabled so a code push does not restart the
-line unexpectedly. Push code updates to GitHub and manually deploy from Render
-between production sessions. Browsers must sign in again after a restart.
-Changing environment variables or the Blueprint can also restart the service.
+3. DEPLOY A FREE RENDER WEB SERVICE
+At https://dashboard.render.com choose New > Blueprint, connect the repository,
+and use render.yaml at its root. Enter these four environment variables:
+  TURSO_DATABASE_URL       Your database base URL, not a pipeline endpoint
+  TURSO_AUTH_TOKEN         Your database read/write token
+  TRAILMIX_ACCESS_CODE     A long private code shared with operators
+  TRAILMIX_SAFETY_PIN      A separate private Safety Rover code
 
-Export records regularly. Render disk snapshots provide a recovery option;
-keep separate downloaded exports. For a complete SQLite backup, use a maintenance
-window with writes stopped and copy the database and associated files, or use
-SQLite's backup API to produce a consistent backup before downloading it. Never
-commit operational databases to GitHub. JSON exports are for analysis, not an
-implemented restore/import interface. This package does not upload existing
-local production records automatically; an initial cloud deployment starts fresh.
+The Blueprint also sets TRAILMIX_HTTPS=1 for secure cookies and plan: free.
+Confirm the proposed service is Free, has no disk, and creates no Render Postgres
+service. Keep provider plans Free; avoid enabling paid overages. Check current
+usage limits at https://render.com/docs/free and https://turso.tech/pricing
+before accepting any signup/billing choices. Deploy and open the HTTPS URL.
 
-NETWORK AND LIVE UPDATES
-One authenticated server-sent events (SSE) connection delivers changes after
-sign-in, with a keepalive about every 20 seconds. This is one open request, not
-new requests every two seconds. No live connection or recurring API requests run
-while the access-code screen is waiting. Explicit saves and view/name changes
-still send requests. If a proxy interrupts the live connection, the browser
-reconnects; Reconnect is also available. Keep Internet access during production.
-Partly entered weights and open dialogs are protected from background updates.
+If you already created a Blueprint from the earlier paid-disk package, do not
+assume uploading new YAML removes its existing disk or billing. The simplest
+route for an unused installation is a NEW Free web service connected to this
+repository, with the four variables above and start command python -u server.py.
+An existing billed service/disk must be managed separately in Render's dashboard.
+Do not delete any disk containing records before making and verifying a backup.
+This app does not transfer an existing local/Render SQLite database automatically.
 
-OTHER HOSTS
-Any Python host with HTTPS, long-lived HTTP responses and a persistent writable
-disk can run python -u server.py. It must provide PORT, TRAILMIX_DB,
-TRAILMIX_ACCESS_CODE, TRAILMIX_SAFETY_PIN and TRAILMIX_HTTPS=1. The Dockerfile is
-also supplied for hosts with Docker volumes. A static-only host is insufficient.
+4. CONNECT AND VERIFY
+Open the same HTTPS URL on every station and projector. Enter the team code and
+name. A browser appears under Devices after connecting. Name it and assign its
+operator and station. Different browser profiles are separate identities; tabs
+in one profile share an identity. No campus network scanning is involved.
 
-OFFICIAL REFERENCES
-https://render.com/docs/web-services
-https://render.com/docs/blueprint-spec
-https://render.com/docs/disks
-https://render.com/docs/compute-plans
-https://docs.github.com/en/pages/getting-started-with-github-pages/what-is-github-pages
+Before the production session, make a practice run with two devices. Check
+updates, weight entry, keyboard binds, deliveries, and exports. Restart Render,
+reconnect, and verify the records persist in Turso. Do not treat local test-suite
+success as verification of your actual cloud credentials or campus connection.
+
+FREE-TIER LIMITATIONS
+Render Free sleeps after 15 minutes without incoming traffic. Waking can take
+about one minute. Outgoing SSE keepalives do not guarantee the service stays
+awake. Render can also restart a Free service; enter the team code again after
+restarts. Database records remain in Turso independently of Render restarts.
+Render explicitly recommends paid services for production reliability. This
+free configuration is a best-effort option for the classroom project, with no
+uptime guarantee. Start and test it before the session, and keep a paper fallback.
+
+Free tiers have storage, requests, runtime and bandwidth limits. An exhausted
+quota can stop saves or availability. Render also limits unusually high outgoing
+traffic, including external database access. Keep exports/backups so records are
+not dependent on ongoing free-tier availability. Monitor each provider's usage.
+Render's free PostgreSQL database expires after 30 days; this app does not use it.
+
+DATA AND SAVES
+The hosted app connects directly to Turso SQL over HTTPS. It does not use a local
+SQLite replica, and it never falls back to temporary storage when remote config
+is missing on Render. Local runs without Turso variables still use SQLite at
+data/trailmix.sqlite3. Set both Turso variables to opt into remote storage.
+
+One remote transaction saves the run state, event and idempotency request record
+together. A database interruption leaves the save pending. Use Retry the same
+save and do not repeat the physical operation. If the original commit succeeded
+but its confirmation was lost, retry returns it without recording a duplicate.
+Keep the tab open until resolved. Transactions have short provider timeouts, so
+network latency can cause retries. Only one backend should write this database.
+
+After sign-in, one SSE connection carries live changes, with a keepalive about
+every 20 seconds. These are not repeated HTTP requests. Idle pings use in-memory
+presence and do not query Turso. No recurring requests or SSE run while waiting
+for the access code. Explicit actions/view changes still send requests.
+
+BACKUPS AND UPDATES
+Export events/weights/bags and complete run JSON regularly and download them.
+For a restorable database backup, use Turso's database export/dump tools:
+https://docs.turso.tech/sdk/http/reference (GET /dump)
+Keep the dump outside GitHub along with your operational exports. Protect any
+command or shell history containing the database token. JSON exports support
+analysis; this app has no JSON import/restore UI. Downloading exports alone is
+not an automatic disaster-recovery process.
+
+Automatic application deploys are disabled. Push code to GitHub, then manually
+deploy between production sessions. Changing Blueprint settings can restart the
+service. Keep all four secret environment variables through updates. A changed
+or expired database token must be replaced in Render settings and redeployed.
+Deleting the Render service does not delete Turso data; deleting the Turso
+database does. Never delete real records without verified backups.
+
+VALIDATION
+Local SQLite tests, remote HTTP protocol tests using a local SQLite gateway,
+keyboard checks, and the live application workflow pass. A live Turso deployment
+has not been tested with user credentials, and real browser visual checks remain
+necessary on your station devices. No paid resources have been provisioned.

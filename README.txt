@@ -1,5 +1,10 @@
 TRAILMIX PRODUCTION DESK
 
+FREE HOSTING EDITION
+Use Render Free + a separate Turso Free libSQL database. See README.md and
+REMOTE_HOSTING.txt first for cloud setup. No paid Render disk is required.
+The local SQLite instructions below still apply when running on your own PC.
+
 A browser-based production tracker for the supplied Trail Mix Project SOP,
 with the requested amendment: both underweight and overweight bags go to
 weight rework. Rework clearance always requires a return to First Inspection.
@@ -261,7 +266,7 @@ No offline write queue is used. If a save's response is lost, use Retry the same
 save and do not repeat the physical operation. Request IDs prevent duplicate
 records if the original save succeeded. Keep that browser tab open until the save
 is resolved. After an interrupted/reloaded tab, check Activity before repeating
-an action whose outcome is uncertain. The server database survives restarts.
+an action whose outcome is uncertain. Local SQLite survives local server restarts. Hosted Turso records survive Render restarts.
 
 At run end, Safety reconciles unfinished product and remaining empty inventory.
 The reconciliation records all unfinished filled bags as discarded and records
@@ -271,7 +276,9 @@ an inventory adjustment.
 
 BACKUPS
 
-The default database is data/trailmix.sqlite3 beside server.py. Export records
+The default LOCAL database is data/trailmix.sqlite3 beside server.py. Hosted
+records instead live in Turso; see REMOTE_HOSTING.txt for its backup procedure.
+Export records
 regularly. For a complete restorable backup, stop the server cleanly and copy the
 entire data folder. To restore, stop the server, replace that folder with a saved
 copy, then restart. Do not use the SQLite files from the test environment.
@@ -285,19 +292,17 @@ stable Safety PIN. Existing browser sessions must reconnect after a restart.
 TRAILMIX_DB sets the database path; --db also sets it. --port or PORT sets the
 port; the default is 8080. Bind defaults to 0.0.0.0 for access from station devices.
 
-For deployment to a server: run python server.py with the platform's assigned
-PORT, persistent TRAILMIX_DB storage, and stable codes in secret environment
-variables. Terminate HTTPS at the platform or reverse proxy, and set
-TRAILMIX_HTTPS=1 to require secure cookies. Keep the data directory private.
-Do not use an ephemeral filesystem for production records. See REMOTE_HOSTING.txt and render.yaml for GitHub-to-Render deployment.
-No live service has been deployed by this package. The included Dockerfile is an optional deployment route:
+For FREE remote deployment: render.yaml selects Render Free with an external
+Turso libSQL database. Set TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, the team code,
+and Safety PIN in Render. No persistent Render disk is used. See README.md and
+REMOTE_HOSTING.txt. A missing remote database configuration on Render stops
+startup rather than allowing records to be written to temporary storage.
+No live deployment or cloud account has been created by this package.
 
+The included Dockerfile is optional for local deployments with a Docker volume:
   docker build -t trailmix .
   docker run --rm -p 8080:8080 -v trailmix-data:/data trailmix
-
-The printed random access code and Safety PIN are in that container's console.
-The simple server is intended for a small classroom production line, not a
-large publicly exposed service. Serve it behind managed HTTPS if Internet-facing.
+Do not set TRAILMIX_HTTPS=1 on a plain HTTP local deployment.
 
 VALIDATION
 
@@ -310,7 +315,7 @@ Never run that workflow harness against a real production database.
 The included tests cover inventory, handoffs, high/low rework, independent return
 inspection, label disposal, mass conversion, inclusive limits, duplicate saves,
 concurrent write conflicts, Safety controls, final checks, rebag lineage, append-
-only records, archives, persistence, devices, authenticated live updates, and
+only records, archives, persistence, devices, authenticated live updates, remote HTTP transactions, and
 CSV formula protection.
 
 Frontend syntax and live HTTP/DOM-flow checks were performed. A full Chromium

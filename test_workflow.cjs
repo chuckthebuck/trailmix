@@ -111,6 +111,11 @@ const remoteRequest={action:'deviceUpdate',operator:'Remote coordinator',args:{d
 const remoteResponse=await fetch(base+'/api/action',{method:'POST',headers:{Cookie:cookie,'Content-Type':'application/json','X-TrailMix':'1'},body:JSON.stringify(remoteRequest)});assert(remoteResponse.ok);const remote=await remoteResponse.json();
 streams[0].listeners.state({data:JSON.stringify(remote.state)});assert.equal(run('stationMode'),'inspection');assert.equal(node('inspectionMass').value,'1.66');assert.equal(node('operator').value,'Before assignment');assert(run('deviceAssignmentPending'));
 await action("doAction('weigh',"+run("q('inspection')[0].id")+")");assert.equal(run('stationMode'),'finalMover');assert.equal(node('operator').value,'Mover One');assert.equal(run("state.events[state.events.length-1].operator"),'Before assignment');assert(!run('deviceAssignmentPending'));
+// A transient remote storage error retains the original request ID for a safe retry.
+const realFetch=context.fetch;let simulatedUnavailable=false;
+context.fetch=async(path,options)=>{const response=await realFetch(path,options);if(path==='/api/action'&&!simulatedUnavailable){assert(response.ok);await response.json();simulatedUnavailable=true;return {ok:false,status:503,json:async()=>({error:'Save not confirmed',retryable:true})}}return response};
+const labelsBeforeRetry=run('state.labels');await run("send('label',{qty:1})");assert(run('pending'));const preservedRequest=run('pending.requestId');context.fetch=realFetch;
+await run('retryPending()');assert(!run('pending'));assert.equal(run('state.labels'),labelsBeforeRetry+1);assert(node('toast').textContent.includes('no duplicate'));assert(preservedRequest);
 const data=run('JSON.stringify(state)');assert(!data.includes('123456'));
 console.log(JSON.stringify({result:'PASS',liveHttp:true,domHarness:true,views:10,weights:run('state.bags[0].measurements.length'),events:run('state.events.length'),overweightRework:true,independentReinspection:true,authAndOriginChecks:true,stationModes:11,stationActionsSaved:true,stationPreferenceSaved:true,visualRendering:'Not tested: browser binary unavailable'}));
 })().catch(e=>{console.error(e);process.exit(1)});

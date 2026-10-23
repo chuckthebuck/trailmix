@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 from server import Store, Handler, ThreadingHTTPServer
+from turso_db import RemoteDatabaseError
 
 
 class QuietHandler(Handler):
@@ -76,6 +77,19 @@ class LiveTests(unittest.TestCase):
             self.assertIn(flag,headers['Set-Cookie'])
         status, _, _ = self.request('POST','/api/login',{'code':'wrong'})
         self.assertEqual(status,401)
+
+    def test_database_outage_returns_retryable_without_leaking_details(self):
+        _, headers, _ = self.request('POST','/api/login',{'code':'test-access'})
+        cookie = headers['Set-Cookie'].split(';')[0]
+        with patch.object(self.store, 'command', side_effect=RemoteDatabaseError('private database details')):
+            status, _, body = self.request('POST','/api/action',self.command(1),cookie)
+        self.assertEqual(status,503)
+        self.assertTrue(body['retryable'])
+        self.assertNotIn('private',json.dumps(body))
+        with patch.object(self.store, 'state', side_effect=RemoteDatabaseError('private database details')):
+            status, _, body = self.request('GET','/api/state',cookie=cookie)
+        self.assertEqual(status,503)
+        self.assertTrue(body['retryable'])
 
     def test_one_connection_receives_initial_state_and_saved_changes(self):
         _, headers, _ = self.request('POST','/api/login',{'code':'test-access'})

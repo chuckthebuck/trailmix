@@ -1,22 +1,21 @@
-# Paid web service + persistent disk. Review Render billing before deploying.
+# Free Render web service + external free Turso libSQL database.
+# Set up Turso first; no local database or paid persistent disk is used.
 services:
   - type: web
     name: trailmix-production-desk
     runtime: python
-    plan: 0.5c-512mb
+    plan: free
     region: oregon
     numInstances: 1
-    buildCommand: python -m py_compile server.py
+    buildCommand: python -m py_compile server.py turso_db.py
     startCommand: python -u server.py
     healthCheckPath: /
     autoDeployTrigger: "off"
-    disk:
-      name: trailmix-records
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
-      - key: TRAILMIX_DB
-        value: /var/data/trailmix.sqlite3
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
       - key: TRAILMIX_HTTPS
         value: "1"
       - key: TRAILMIX_ACCESS_CODE
