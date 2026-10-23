@@ -34,7 +34,8 @@ def create(*args, **kwargs):
 server.ThreadingHTTPServer = create
 server.main()
 """
-        env = dict(os.environ, TRAILMIX_ACCESS_CODE='test-access',
+        env = {k:v for k,v in os.environ.items() if k not in ('RENDER','TURSO_DATABASE_URL','TURSO_AUTH_TOKEN')}
+        env = dict(env, TRAILMIX_ACCESS_CODE='test-access',
                    TRAILMIX_SAFETY_PIN='123456', TRAILMIX_HTTPS='0')
         proc = subprocess.Popen(
             [sys.executable, '-u', '-c', launcher, '--host', '127.0.0.1',

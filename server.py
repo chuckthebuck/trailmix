@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+from turso_db import TursoConnection, RemoteDatabaseError
 
 ROOT = Path(__file__).resolve().parent
 OZ = 28.349523125
@@ -40,7 +41,11 @@ class Problem(Exception):
 
 
 class Store:
-    def __init__(self, path, safety_pin):
+    def __init__(self, path, safety_pin, *, turso_url=None, turso_token=None):
+        if bool(turso_url) != bool(turso_token):
+            raise ValueError("Set both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN; refusing a local fallback.")
+        self.turso_url, self.turso_token = turso_url, turso_token
+        self.database_lock = threading.RLock()
         self.path, self.safety_pin = str(path), safety_pin
         self.presence_lock = threading.Lock()
         self.changed = threading.Condition()
@@ -58,6 +63,7 @@ class Store:
                 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT,'Event history is append-only'); END;
                 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT,'Event history is append-only'); END;
             ''')
+            db.execute('BEGIN IMMEDIATE')
             if not db.execute("SELECT value FROM meta WHERE key='current'").fetchone():
                 s = fresh()
                 db.execute('INSERT INTO runs(id,state) VALUES (?,?)', (s['runId'], json.dumps(s)))
@@ -65,16 +71,23 @@ class Store:
 
     @contextmanager
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=20)
-        db.execute('PRAGMA busy_timeout=20000')
-        try:
-            yield db
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+        # A single backend owns live notifications; serialize remote transactions.
+        with self.database_lock:
+            db = (TursoConnection(self.turso_url, self.turso_token) if self.turso_url
+                  else sqlite3.connect(self.path, timeout=20))
+            try:
+                if not self.turso_url:
+                    db.execute('PRAGMA busy_timeout=20000')
+                yield db
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass  # Preserve the original error, including uncertain commits.
+                raise
+            finally:
+                db.close()
 
     @staticmethod
     def load(db, run=None):
@@ -155,7 +168,11 @@ class Store:
             if prior:
                 if not hmac.compare_digest(prior[0], digest):
                     raise Problem('Request ID already used for a different action.')
-                return dict(state=self.load(db), duplicate=True)
+                response = dict(state=self.load(db), duplicate=True)
+                db.commit()
+                self.attach_presence(response['state'])
+                self.notify_change()  # The original commit may have lost its response.
+                return response
             s = self.load(db)
             if req.get('runId') != s['runId']:
                 raise Problem('The active run changed. Refresh before recording an action.')
@@ -657,6 +674,9 @@ class Handler(BaseHTTPRequestHandler):
             run = params.get('run', [None])[0]
             if path == '/api/stream':
                 did = params.get('deviceId',[''])[0]
+                with self.server.store.changed:
+                    seen = self.server.store.serial
+                initial_state = self.server.store.state()
                 self.send_response(200)
                 self.send_header('Content-Type','text/event-stream')
                 self.send_header('Cache-Control','no-cache, no-transform')
@@ -667,21 +687,22 @@ class Handler(BaseHTTPRequestHandler):
                 def emit(kind, data):
                     self.wfile.write(('event: '+kind+'\ndata: '+json.dumps(data)+'\n\n').encode())
                     self.wfile.flush()
-                with self.server.store.changed:
-                    seen = self.server.store.serial
                 try:
                     self.server.store.touch_device(did)
-                    emit('state',self.server.store.state())
+                    emit('state',initial_state)
                     while True:
                         with self.server.store.changed:
                             changed = self.server.store.changed.wait_for(lambda:self.server.store.serial!=seen,timeout=20)
                             seen = self.server.store.serial
                         self.server.store.touch_device(did)
                         if changed:
-                            emit('state',self.server.store.state())
+                            initial_state = self.server.store.state()
+                            emit('state',initial_state)
                         else:
-                            emit('ping',dict(at=NOW(), devices=self.server.store.state()['devices']))
-                except (BrokenPipeError,ConnectionResetError,TimeoutError):
+                            devices = copy.deepcopy(initial_state['devices'])
+                            self.server.store.attach_presence({'devices':devices})
+                            emit('ping',dict(at=NOW(), devices=devices))
+                except (BrokenPipeError,ConnectionResetError,TimeoutError,RemoteDatabaseError):
                     pass
                 return
             if path == '/api/state':
@@ -695,16 +716,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, data, mime, filename='trailmix-'+kind+('.json' if kind=='json' else '.csv'))
             else:
                 self.respond(404, {'error':'Not found.'})
+        except RemoteDatabaseError:
+            self.respond(503, {'error':'Database unavailable. Reconnect or retry the same save.', 'retryable':True})
         except Problem as e:
             self.respond(400, {'error':str(e)})
 
     def do_POST(self):
         # Custom header + JSON prevent cross-site form submissions (no CORS allowed).
         if self.headers.get('X-TrailMix') != '1' or self.headers.get('Content-Type','').split(';')[0] != 'application/json':
+            self.close_connection = True  # Rejected body is intentionally unread.
             self.respond(403, {'error':'Invalid request origin or content type.'})
             return
         origin = self.headers.get('Origin')
         if origin and urlparse(origin).netloc != self.headers.get('Host'):
+            self.close_connection = True
             self.respond(403, {'error':'Cross-origin writes are not allowed.'})
             return
         try:
@@ -740,6 +765,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(404, {'error':'Not found.'})
                 return
             self.respond(200, self.server.store.command(req))
+        except RemoteDatabaseError:
+            self.respond(503, {'error':'Database unavailable or save not confirmed. Retry the same save.', 'retryable':True})
         except (Problem, ValueError, TypeError) as e:
             self.respond(409, {'error':str(e)})
         except Exception:
@@ -755,13 +782,17 @@ def main():
     parser.add_argument('--db', default=os.getenv('TRAILMIX_DB', str(ROOT/'data'/'trailmix.sqlite3')))
     args = parser.parse_args()
     Path(args.db).parent.mkdir(parents=True, exist_ok=True)
-    store = Store(args.db, os.getenv('TRAILMIX_SAFETY_PIN') or secrets.token_hex(4))
+    turso_url, turso_token = os.getenv('TURSO_DATABASE_URL'), os.getenv('TURSO_AUTH_TOKEN')
+    if os.getenv('RENDER') and not turso_url:
+        raise SystemExit('Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN before starting on Render. Local files are not durable on the free plan.')
+    store = Store(args.db, os.getenv('TRAILMIX_SAFETY_PIN') or secrets.token_hex(4),
+                  turso_url=turso_url, turso_token=turso_token)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.store = store
     server.access_code = os.getenv('TRAILMIX_ACCESS_CODE') or secrets.token_urlsafe(12)
     server.auth_cookie = secrets.token_urlsafe(32)
     server.login_failures, server.login_blocked_until = 0, 0
-    print(f'\nTrailMix is running at http://localhost:{args.port}\nOther devices: http://THIS-COMPUTERS-LAN-IP:{args.port}\nTeam access code: {server.access_code}\nSafety Rover PIN: {store.safety_pin}\nDatabase: {Path(args.db).resolve()}\nUse Ctrl+C to stop.\n', flush=True)
+    print(f'\nTrailMix is running at http://localhost:{args.port}\nOther devices: http://THIS-COMPUTERS-LAN-IP:{args.port}\nTeam access code: {server.access_code}\nSafety Rover PIN: {store.safety_pin}\nDatabase: {'Turso (remote persistent storage)' if turso_url else Path(args.db).resolve()}\nUse Ctrl+C to stop.\n', flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
