@@ -24,18 +24,35 @@ from turso_db import TursoConnection, RemoteDatabaseError
 ROOT = Path(__file__).resolve().parent
 OZ = 28.349523125
 NOW = lambda: int(time.time() * 1000)
-QUEUED_ACTIONS = {'label', 'labelPickup', 'receiveLabels', 'fill', 'move', 'receive',
+DELIVERY_LEGS = {'labels':('Labeling','Filling','stocker',None),
+ 'filled':('Filling','First inspection','firstMover','inspectionTransit'),
+ 'hold':('First inspection','Rework','finalMover','reworkTransit'),
+ 'returnReady':('Rework','First inspection','finalMover','returnTransit'),
+ 'ready':('First inspection','Sealing','finalMover','sealTransit'),
+ 'sealed':('Sealing','Final inspection','finalMover','finalTransit')}
+
+def route_allowed(person, source, station):
+    if not person or person.get('deletedAt') or source not in DELIVERY_LEGS:
+        return False
+    roles=person['assignments']
+    return (DELIVERY_LEGS[source][2] in roles or 'delivery:'+source+':*' in roles or
+            'delivery:'+source+':'+str(station) in roles)
+
+QUEUED_ACTIONS = {'routePickup', 'routeDeliver', 'label', 'labelPickup', 'receiveLabels', 'fill', 'move', 'receive',
                   'weigh', 'clear', 'seal', 'failSeal', 'finish', 'finalFail'}
-STAFF_ACTIONS = {'personAddMany', 'personAdd', 'personUpdate', 'messagePost', 'messageAcknowledge', 'messageResolve',
+CLASS_ROSTER = ['Truus','Leslie','Blake','David','Brian','Aiden','Megan','Fabio','Katelyn','Elias','Halen','Dylan','Luke','Hailey','Marie','Keira','Natalie','Charlie','Beaton','Veena','Nico','Aum','Alexander','Martin','Logan','Lucas','Vito','Sarah']
+SAFETY_ROSTER = {'lucas','blake','charlie'}
+
+STAFF_ACTIONS = {'personDelete', 'personRestore', 'rosterImport', 'personAddMany', 'personAdd', 'personUpdate', 'messagePost', 'messageAcknowledge', 'messageResolve',
                  'deviceRegister', 'deviceUpdate'}
 
 
 def fresh():
     return dict(version=2, revision=0, runId=str(uuid.uuid4()), batch='Trail mix · Run 01',
-                started=NOW(), demo=False, limits=dict(min=1.5, max=1.75, confirmed=True),
+                started=NOW(), demo=False, limits=dict(min=2.0, max=2.25, confirmed=True),
                 stations=[dict(id=i, empty=0, batch='') for i in range(1, 4)],
                 labels=0, moves=[], bags=[], events=[], next=1, safetyHold=False,
-                people=[], messages=[], devices=[])
+                people=[], messages=[], devices=[], deliveries=[])
 
 
 class Problem(Exception):
@@ -118,6 +135,7 @@ class Store:
         state.setdefault('people', [])
         state.setdefault('messages', [])
         state.setdefault('devices', [])
+        state.setdefault('deliveries', [])
         return state
 
     @staticmethod
@@ -223,7 +241,7 @@ class Store:
             if isinstance(revision, bool) or not isinstance(revision, int) or not 0 <= revision <= s['revision']:
                 raise Problem('Invalid run revision. Refresh and retry.')
             queued = req.get('queued') is True and action in QUEUED_ACTIONS
-            if queued and action in ('move', 'receive') and not isinstance(args.get('expectedBagIds'), list):
+            if queued and (action in ('move', 'receive') or action=='routePickup' and args.get('source')!='labels') and not isinstance(args.get('expectedBagIds'), list):
                 raise Problem('Queued delivery requires the exact bags selected at pickup or receipt.')
             if queued and action == 'fill' and not isinstance(args.get('mixBatch'), str):
                 raise Problem('Queued fill requires the recorded mixing batch.')
@@ -271,12 +289,131 @@ class Store:
                     ("UPDATE meta SET value=? WHERE key='current'", (new['runId'],))])
                 s = new
             writes.append(('INSERT INTO requests VALUES (?,?,?)', (request_id, digest, old['runId'])))
+            if action=='workflowUpgrade':
+                writes.append(("INSERT INTO meta(key,value) VALUES ('delivery_limits_v3','done') ON CONFLICT(key) DO NOTHING",()))
+            if action=='rosterImport':
+                writes.append(("INSERT INTO meta(key,value) VALUES ('class_roster_v1','done') ON CONFLICT(key) DO NOTHING",()))
             self.execute_group(db, writes)
             response = dict(state=s, event=event)
         self.cached_current = copy.deepcopy(response['state'])
         self.attach_presence(response['state'])
         self.notify_change()
         return response
+
+    def upgrade_workflow(self):
+        with self.connect() as db:
+            if db.execute("SELECT value FROM meta WHERE key='delivery_limits_v3'").fetchone():
+                return
+        state=self.state()
+        return self.command(dict(action='workflowUpgrade',args={},operator='Workflow update',
+            requestId='delivery-limits-v3',runId=state['runId'],revision=state['revision']))
+
+    def seed_class_roster(self):
+        with self.connect() as db:
+            if db.execute("SELECT value FROM meta WHERE key='class_roster_v1'").fetchone():
+                return
+        state = self.state()
+        return self.command(dict(action='rosterImport',args={},operator='Roster setup',
+            requestId='class-roster-v1',runId=state['runId'],revision=state['revision']))
+
+    def commands(self, requests):
+        """Commit up to fifty queued station actions in three remote round trips.
+
+        Each action keeps its own ID and audit event. A failure rolls back the
+        entire batch; a lost response can be retried without repeating actions.
+        """
+        if not isinstance(requests, list) or not 1 <= len(requests) <= 50:
+            raise Problem('Send between 1 and 50 station actions.')
+        ids = []
+        digests = []
+        for req in requests:
+            if not isinstance(req, dict) or req.get('action') not in QUEUED_ACTIONS or req.get('queued') is not True:
+                raise Problem('Batches accept queued station actions only.')
+            rid, operator = req.get('requestId'), req.get('operator')
+            if not isinstance(rid, str) or not 8 <= len(rid) <= 100 or rid in ids:
+                raise Problem('Use distinct valid action IDs in a batch.')
+            if not isinstance(operator, str) or not operator.strip() or len(operator.strip()) > 100 or not isinstance(req.get('args'), dict):
+                raise Problem('Enter an operator name and valid action arguments.')
+            ids.append(rid)
+            digests.append(hashlib.sha256(json.dumps(req, sort_keys=True).encode()).hexdigest())
+        with self.database_lock:
+            with self.connect() as db:
+                _, prior_rows, state_rows = self.execute_group(db, [
+                    ('BEGIN IMMEDIATE', ()),
+                    ('SELECT id,digest FROM requests WHERE id IN ('+','.join('?' for _ in ids)+')', tuple(ids)),
+                    ("SELECT state FROM runs WHERE id=(SELECT value FROM meta WHERE key='current')", ())])
+                prior = dict(prior_rows.fetchall())
+                state = self.decode_state(state_rows.fetchone())
+                results, writes, remap = [], [], {}
+                event_by_request = {e.get('requestId'):e for e in state['events'] if e.get('requestId')}
+                for event in state['events']:
+                    if event.get('requestId') and event['action'] in ('fill','labelPickup','routePickup'):
+                        created = event['bags'][0] if event['action']=='fill' else event['changes']['movementId'] if event['action']=='labelPickup' else event['changes']['deliveryIds'][0]
+                        remap['pending-'+event['requestId']] = created
+                        if event['action']=='routePickup' and event['changes'].get('movementId') is not None:
+                            remap['pending-move-'+event['requestId']] = event['changes']['movementId']
+                for req, digest in zip(requests, digests):
+                    rid, action = req['requestId'], req['action']
+                    if rid in prior:
+                        if not hmac.compare_digest(prior[rid], digest):
+                            raise Problem('Request ID already used for a different action.')
+                        results.append(dict(requestId=rid, duplicate=True, event=event_by_request.get(rid)))
+                        continue
+                    if req.get('runId') != state['runId']:
+                        raise Problem('The active run changed. Review held station entries.')
+                    revision = req.get('revision')
+                    if isinstance(revision,bool) or not isinstance(revision,int) or not 0 <= revision <= state['revision']:
+                        raise Problem('Invalid run revision.')
+                    args = copy.deepcopy(req['args'])
+                    for key in ('bag','movement','delivery'):
+                        if key in args:args[key] = remap.get(args[key],args[key])
+                    if action in ('move','receive') or action=='routePickup' and args.get('source')!='labels':
+                        if not isinstance(args.get('expectedBagIds'),list):
+                            raise Problem('Queued delivery requires the exact selected bags.')
+                        args['expectedBagIds'] = [remap.get(value,value) for value in args['expectedBagIds']]
+                    if action=='fill' and not isinstance(args.get('mixBatch'),str):
+                        raise Problem('Queued fill requires the recorded mixing batch.')
+                    before_people = state['people']
+                    selected = set(args.get('expectedBagIds',[]))
+                    if 'bag' in args:selected.add(args['bag'])
+                    if action=='routeDeliver':
+                        package=next((d for d in state['deliveries'] if d['id']==args.get('delivery')),None)
+                        if package:selected.update(package.get('remainingBagIds',[]))
+                    before_bags = copy.deepcopy([b for b in state['bags'] if b['id'] in selected])
+                    when = NOW()
+                    operator = req['operator'].strip()
+                    result = self.apply(state, action, args, operator, when)
+                    state['revision'] += 1
+                    payload = {k:v for k,v in args.items() if k!='safetyPin'}
+                    event = dict(id=str(uuid.uuid4()), at=when, operator=operator, requestId=rid,
+                        recordedAt=req.get('recordedAt'), recordedStation=req.get('recordedStation'),
+                        type=result.pop('type',action), action=action, qty=result.get('qty',len(result.get('bags',[]))),
+                        bags=result.get('bags',[]), detail=result.get('detail',''), data=payload,
+                        changes=result, revision=state['revision'], runId=state['runId'])
+                    person = next((p for p in before_people if p['name'].casefold()==operator.casefold()),None)
+                    device = next((d for d in state['devices'] if d['id']==req.get('deviceId')),None)
+                    event.update(personId=person['id'] if person else None,
+                        assignments=copy.deepcopy(person['assignments']) if person else [],
+                        deviceId=device['id'] if device else None,deviceName=device['name'] if device else None)
+                    affected = set(event['bags'])
+                    event['before'] = [b for b in before_bags if b['id'] in affected]
+                    event['after'] = copy.deepcopy([b for b in state['bags'] if b['id'] in affected])
+                    state['events'].append(event)
+                    writes.extend([
+                        ('INSERT INTO events(id,run_id,at,operator,action,payload,result) VALUES (?,?,?,?,?,?,?)',
+                         (event['id'],state['runId'],when,operator,action,json.dumps(payload),json.dumps(event))),
+                        ('INSERT INTO requests VALUES (?,?,?)',(rid,digest,state['runId']))])
+                    results.append(dict(requestId=rid,duplicate=False,event=event))
+                    if action in ('fill','labelPickup','routePickup'):
+                        remap['pending-'+rid] = (event['bags'][0] if action=='fill' else event['changes']['movementId'] if action=='labelPickup' else event['changes']['deliveryIds'][0])
+                        if action=='routePickup' and event['changes'].get('movementId') is not None:
+                            remap['pending-move-'+rid] = event['changes']['movementId']
+                writes.append(('UPDATE runs SET state=? WHERE id=?',(json.dumps(state),state['runId'])))
+                self.execute_group(db,writes)
+            self.cached_current = copy.deepcopy(state)
+            self.attach_presence(state)
+            self.notify_change()
+            return dict(state=state,results=results)
 
     def apply(self, s, action, a, operator, when):
         def fail(message):
@@ -324,6 +461,35 @@ class Store:
         def result(kind, bs=(), detail='', **extra):
             return dict(type=kind, bags=[b['id'] for b in bs], detail=detail, **extra)
 
+        def person_for(name):
+            return next((p for p in s['people'] if not p.get('deletedAt') and p['name'].casefold()==name.casefold()),None)
+
+        def shipment(source, station, bs=(), movement=None, legacy=False, who=None, at=None):
+            owner=who or operator
+            person=person_for(owner)
+            d=dict(id=str(uuid.uuid4()),source=source,station=station,bagIds=[b['id'] for b in bs],
+                remainingBagIds=[b['id'] for b in bs],qty=movement['qty'] if movement else len(bs),
+                movementId=movement['id'] if movement else None,status='transit',pickedAt=at or when,
+                pickedBy=owner,personId=person['id'] if person else None,receipts=[],legacy=legacy)
+            s['deliveries'].append(d)
+            return d
+
+        def receipt(bs=(), movement=None):
+            ids={b['id'] for b in bs}
+            changed=[]
+            for d in s['deliveries']:
+                if d['status']!='transit':continue
+                received=[id for id in d['remainingBagIds'] if id in ids]
+                label_match=movement is not None and d.get('movementId')==movement
+                if not received and not label_match:continue
+                before=copy.deepcopy(d)
+                d['remainingBagIds']=[id for id in d['remainingBagIds'] if id not in ids]
+                d['receipts'].append(dict(at=when,operator=operator,qty=d['qty'] if label_match else len(received),bags=received))
+                if label_match or not d['remainingBagIds']:
+                    d.update(status='delivered',deliveredAt=when,deliveredBy=operator)
+                changed.append(dict(before=before,after=copy.deepcopy(d)))
+            return changed
+
         def measure(b, kind):
             value = a.get('mass')
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0 or value > 10000:
@@ -332,16 +498,17 @@ class Store:
             if unit not in ('oz', 'g'):
                 fail('Select oz or g.')
             oz = value if unit == 'oz' else value / OZ
-            m = dict(id=str(uuid.uuid4()), oz=oz, entered=value, unit=unit, at=when, operator=operator, kind=kind)
+            m = dict(id=str(uuid.uuid4()), oz=oz, entered=value, unit=unit, at=when, operator=operator, kind=kind,
+                     minOz=s['limits']['min'],maxOz=s['limits']['max'],passed=s['limits']['min']-1e-9<=oz<=s['limits']['max']+1e-9)
             b['measurements'].append(m)
             return oz, s['limits']['min'] - 1e-9 <= oz <= s['limits']['max'] + 1e-9
 
-        if s.get('safetyHold') and action not in ('safetyRelease', 'note', 'safetyReport', 'spotcheck',
-                'personAddMany', 'personAdd', 'personUpdate', 'messagePost', 'messageAcknowledge', 'messageResolve',
+        if s.get('safetyHold') and action not in ('workflowUpgrade','safetyRelease', 'note', 'safetyReport', 'spotcheck',
+                'personDelete', 'personRestore', 'rosterImport', 'personAddMany', 'personAdd', 'personUpdate', 'messagePost', 'messageAcknowledge', 'messageResolve',
                 'deviceRegister', 'deviceUpdate'):
             fail('Production is on a safety hold. Ask the Safety Rover to release it.')
         roles = {'label', 'inspection', 'rework', 'sealing', 'final', 'stocker', 'firstMover',
-                 'finalMover', 'mixing', 'safety', 'coordinator'} | {'fill:'+str(st['id']) for st in s['stations']}
+                 'finalMover', 'mixing', 'safety', 'coordinator'} | {'delivery:'+source+':'+str(station) for source in DELIVERY_LEGS for station in ['*']+[st['id'] for st in s['stations']]} | {'fill:'+str(st['id']) for st in s['stations']}
 
         def assignments():
             values = a.get('assignments', [])
@@ -366,14 +533,14 @@ class Store:
             if a.get('expectedVersion') != device['version']:
                 fail('This device was updated elsewhere. Review its current assignment and retry.')
             name, person_id, mode = str(a.get('name','')).strip(), a.get('person',''), a.get('mode','')
-            person = next((p for p in s['people'] if p['id'] == person_id), None)
-            if not name or len(name)>80 or person_id and not person or mode not in roles|{'','dashboard','deliveryDisplay'}:
+            person = next((p for p in s['people'] if p['id'] == person_id and not p.get('deletedAt')), None)
+            if not name or len(name)>80 or person_id and not person or mode not in roles|{'','dashboard','deliveryDisplay','delivery'}:
                 fail('Choose a valid device name, person and station/view.')
             before = copy.deepcopy(device)
             device.update(name=name, personId=person_id, mode=mode, version=device['version']+1,
                           updatedAt=when, updatedBy=operator)
             extra = {}
-            if person and mode in roles and mode not in person['assignments']:
+            if person and mode in roles and mode not in ('stocker','firstMover','finalMover') and mode not in person['assignments']:
                 extra['personBefore'] = copy.deepcopy(person)
                 person['assignments'].append(mode)
                 person.update(version=person.get('version',0)+1, updatedAt=when, updatedBy=operator)
@@ -381,6 +548,111 @@ class Store:
             return result('Device assignment updated', detail=name, deviceBefore=before,
                           deviceAfter=copy.deepcopy(device), **extra)
 
+        if action=='workflowUpgrade':
+            old_limits=copy.deepcopy(s['limits'])
+            affected=[]
+            for b in s['bags']:
+                for m in b['measurements']:
+                    m.setdefault('minOz',old_limits['min']);m.setdefault('maxOz',old_limits['max'])
+                    m.setdefault('passed',m['minOz']-1e-9<=m['oz']<=m['maxOz']+1e-9)
+                inspection=next((m for m in reversed(b['measurements']) if m['kind']=='inspection'),None)
+                if b['status']=='ready' and (not inspection or not 2-1e-9<=inspection['oz']<=2.25+1e-9):
+                    b.update(status='hold',holdAt=when,updated=when);affected.append(b)
+                latest=next((m for m in reversed(b['measurements']) if m['kind']=='rework'),None)
+                if b['status']=='returnReady' and (not latest or not 2-1e-9<=latest['oz']<=2.25+1e-9):
+                    b.update(status='rework',updated=when);affected.append(b)
+            s['limits']=dict(min=2.0,max=2.25,confirmed=True)
+            tracked={id for d in s['deliveries'] if d['status']=='transit' for id in d['remainingBagIds']}
+            for source,leg in DELIVERY_LEGS.items():
+                if source=='labels':continue
+                groups={}
+                for b in s['bags']:
+                    if b['status']!=leg[3] or b['id'] in tracked:continue
+                    event=next((e for e in reversed(s['events']) if b['id'] in e['bags'] and e['action']=='move'),None)
+                    key=(b['station'],event['id'] if event else '')
+                    if key not in groups:groups[key]=[[],event]
+                    groups[key][0].append(b)
+                for (station,_),(bs,event) in groups.items():
+                    shipment(source,station,bs,legacy=True,who=event['operator'] if event else 'Previous pickup',at=event['at'] if event else when)
+            tracked_moves={d.get('movementId') for d in s['deliveries'] if d['status']=='transit'}
+            for m in s['moves']:
+                if not m['received'] and m['id'] not in tracked_moves:
+                    shipment('labels',m['station'],movement=m,legacy=True,who=m['operator'],at=m['at'])
+            return result('Delivery routes and weight limits updated',affected,detail='2.00–2.25 oz net',previousLimits=old_limits,limits=copy.deepcopy(s['limits']),deliveries=copy.deepcopy(s['deliveries']))
+        if action=='routePickup':
+            source,station=a.get('source'),a.get('station')
+            person=person_for(operator)
+            if not route_allowed(person,source,station) or not any(st['id']==station for st in s['stations']):
+                fail('This delivery leg and filling station are not assigned to you.')
+            if source=='labels':
+                response=self.apply(s,'labelPickup',a,operator,when)
+            else:
+                response=self.apply(s,'move',a,operator,when)
+            response['type']='Route pickup'
+            return response
+        if action=='routeDeliver':
+            d=next((d for d in s['deliveries'] if d['id']==a.get('delivery')),None)
+            person=person_for(operator)
+            if not d or d['status']!='transit':fail('This package is already delivered or unavailable.')
+            owned=(person and d.get('personId')==person['id']) or d['pickedBy'].casefold()==operator.casefold()
+            if not owned and not (d.get('legacy') and route_allowed(person,d['source'],d['station'])):
+                fail('This package was picked up by a different operator.')
+            if d['source']=='labels':
+                response=self.apply(s,'receiveLabels',{'movement':d['movementId']},operator,when)
+                response['type']='Route delivered';return response
+            source=DELIVERY_LEGS[d['source']][3]
+            targets=d['remainingBagIds']
+            bs=[next((b for b in s['bags'] if b['id']==id),None) for id in targets]
+            if not bs or any(not b or b['status']!=source for b in bs):
+                fail('Package contents changed. Review this delivery before proceeding.')
+            destinations=dict(inspectionTransit='inspection',reworkTransit='rework',returnTransit='inspection',sealTransit='sealing',finalTransit='final')
+            move(bs,destinations[source])
+            changes=receipt(bs)
+            return result('Route delivered',bs,detail=d['source']+' delivered',deliveryReceipts=changes,qty=len(bs))
+        if action == 'rosterImport':
+            added, updated = [], []
+            for name in CLASS_ROSTER:
+                matches = [p for p in s['people'] if p['name'].split()[0].casefold()==name.casefold()]
+                if len(matches)>1:
+                    fail('Multiple people match '+name+'. Rename the duplicates before importing.')
+                roles_for_person = ['safety'] if name.casefold() in SAFETY_ROSTER else []
+                if matches:
+                    person = matches[0]
+                    if person.get('deletedAt'):
+                        continue
+                    before = copy.deepcopy(person)
+                    person.update(assignments=roles_for_person, updatedAt=when,updatedBy=operator,
+                                  version=person.get('version',0)+1)
+                    updated.append(dict(before=before,after=copy.deepcopy(person)))
+                else:
+                    person = dict(id=str(uuid.uuid4()),name=name,assignments=roles_for_person,
+                        status='available',createdAt=when,updatedAt=when,updatedBy=operator,version=0)
+                    s['people'].append(person)
+                    added.append(copy.deepcopy(person))
+            return result('Class roster prepared',qty=len(added),detail='Lucas, Blake, Charlie: Safety; other class members unassigned',
+                          peopleAdded=added,peopleUpdated=updated)
+        if action in ('personDelete','personRestore'):
+            person = next((p for p in s['people'] if p['id']==a.get('person')),None)
+            if not person:
+                fail('Person not found.')
+            before = copy.deepcopy(person)
+            devices = []
+            if action=='personDelete':
+                if person.get('deletedAt'):fail('Operator is already deleted.')
+                person.update(deletedAt=when,deletedBy=operator,status='off')
+                for d in s['devices']:
+                    if d.get('personId')==person['id']:
+                        previous=copy.deepcopy(d)
+                        d.update(personId='',version=d['version']+1,updatedAt=when,updatedBy=operator)
+                        devices.append(dict(before=previous,after=copy.deepcopy(d)))
+            else:
+                if not person.get('deletedAt'):fail('Operator is already active.')
+                person.pop('deletedAt',None)
+                person.pop('deletedBy',None)
+                person['status']='available'
+            person.update(version=person.get('version',0)+1,updatedAt=when,updatedBy=operator)
+            return result('Operator deleted' if action=='personDelete' else 'Operator restored',
+                          detail=person['name'],personBefore=before,personAfter=copy.deepcopy(person),devicesUpdated=devices)
         if action in ('personAdd', 'personAddMany'):
             names = a.get('names') if action == 'personAddMany' else [a.get('name', '')]
             if not isinstance(names, list) or not 1 <= len(names) <= 100:
@@ -408,11 +680,16 @@ class Store:
                 fail('Person not found.')
             if 'expectedVersion' in a and a['expectedVersion'] != person.get('version', 0):
                 fail('This assignment was changed by someone else. Review the latest assignments and retry.')
+            if person.get('deletedAt'):
+                fail('Restore this operator before changing assignments.')
+            name = str(a.get('name',person['name'])).strip()
+            if not name or len(name)>100 or any(p['id']!=person['id'] and p['name'].casefold()==name.casefold() for p in s['people']):
+                fail('Enter a distinct operator name up to 100 characters.')
             status = a.get('status')
             if status not in ('available', 'working', 'break', 'off'):
                 fail('Select a valid operator status.')
             before = copy.deepcopy(person)
-            person.update(assignments=assignments(), status=status, updatedAt=when, updatedBy=operator,
+            person.update(name=name, assignments=assignments(), status=status, updatedAt=when, updatedBy=operator,
                           version=person.get('version', 0)+1)
             return result('Operator assignments updated', detail=person['name'],
                           personBefore=before, personAfter=copy.deepcopy(person))
@@ -451,7 +728,7 @@ class Store:
             eligible = (message['targetType'] == 'all' or
                         message['targetType'] == 'person' and message['target'] == person['id'] or
                         message['targetType'] == 'station' and message['target'] in person['assignments'] or
-                        message['targetType'] == 'delivery' and any(r in person['assignments'] for r in ('stocker','firstMover','finalMover')))
+                        message['targetType'] == 'delivery' and any(r in ('stocker','firstMover','finalMover') or r.startswith('delivery:') for r in person['assignments']))
             if not eligible:
                 fail('This message is addressed to a different operator or assignment.')
             if any(ack['personId'] == person['id'] for ack in message['acknowledgements']):
@@ -472,7 +749,8 @@ class Store:
             m = dict(id=s['next'], station=station['id'], qty=n, at=when, operator=operator, received=False)
             s['next'] += 1
             s['moves'].append(m)
-            return result('Labeled bags picked up', qty=n, detail='To filling '+str(station['id']), movementId=m['id'])
+            d=shipment('labels',station['id'],movement=m)
+            return result('Labeled bags picked up', qty=n, detail='To filling '+str(station['id']), movementId=m['id'],deliveryIds=[d['id']])
         if action == 'receiveLabels':
             m = next((x for x in s['moves'] if x['id'] == a.get('movement')), None)
             if not m or m['received']:
@@ -480,7 +758,7 @@ class Store:
             st = next(x for x in s['stations'] if x['id'] == m['station'])
             st['empty'] += m['qty']
             m.update(received=True, receivedAt=when, receivedBy=operator)
-            return result('Empty bags received', qty=m['qty'], detail='Filling '+str(st['id']), movementId=m['id'])
+            return result('Empty bags received', qty=m['qty'], detail='Filling '+str(st['id']), movementId=m['id'],deliveryReceipts=receipt(movement=m['id']))
         if action == 'assignBatch':
             st = next((x for x in s['stations'] if x['id'] == a.get('station')), None)
             batch = str(a.get('batch', '')).strip()
@@ -510,8 +788,15 @@ class Store:
             if source not in routes:
                 fail('Invalid pickup route.')
             bs = take(source)
+            if source in ('returnReady','ready'):
+                kind='rework' if source=='returnReady' else 'inspection'
+                for b in bs:
+                    latest=next((m for m in reversed(b['measurements']) if m['kind']==kind),None)
+                    if not latest or not s['limits']['min']-1e-9<=latest['oz']<=s['limits']['max']+1e-9:
+                        fail(('Rework' if source=='returnReady' else 'First inspection')+' must be in spec before delivery.')
             move(bs, routes[source])
-            return result('Transport pickup', bs, source+' → '+routes[source], source=source, destination=routes[source])
+            deliveries=[shipment(source,station,[b for b in bs if b['station']==station]) for station in sorted({b['station'] for b in bs})]
+            return result('Transport pickup', bs, source+' → '+routes[source], source=source, destination=routes[source],deliveryIds=[d['id'] for d in deliveries])
         if action == 'receive':
             routes = dict(inspectionTransit='inspection', reworkTransit='rework', returnTransit='inspection',
                           sealTransit='sealing', finalTransit='final')
@@ -520,13 +805,18 @@ class Store:
                 fail('Invalid receipt route.')
             bs = take(source)
             move(bs, routes[source])
-            return result('Transport received', bs, source+' → '+routes[source], source=source, destination=routes[source])
+            return result('Transport received', bs, source+' → '+routes[source], source=source, destination=routes[source],deliveryReceipts=receipt(bs))
         if action in ('weigh', 'clear'):
             b = bag(['inspection' if action == 'weigh' else 'rework'])
             if queue(b['status'])[0]['id'] != b['id']:
                 fail('Process the oldest bag first.')
             if action == 'weigh' and not isinstance(a.get('labelOK'), bool):
                 fail('Record the label check.')
+            if action=='clear':
+                value=a.get('mass');unit=a.get('unit')
+                oz=value/OZ if unit=='g' and isinstance(value,(int,float)) else value
+                if isinstance(value,bool) or not isinstance(oz,(int,float)) or not math.isfinite(oz) or unit not in ('oz','g') or not s['limits']['min']-1e-9<=oz<=s['limits']['max']+1e-9:
+                    fail(f"Rework must be {s['limits']['min']:.2f}–{s['limits']['max']:.2f} oz net before delivery. Correct the mass and try again.")
             oz, passed = measure(b, 'inspection' if action == 'weigh' else 'rework')
             if action == 'weigh':
                 inspections = [m for m in b['measurements'] if m['kind'] == 'inspection']
@@ -602,6 +892,11 @@ class Store:
         if action == 'spotcheck':
             safety()
             b = bag(['final', 'sealed', 'done', 'finalHold'])
+            if action=='clear':
+                value=a.get('mass');unit=a.get('unit')
+                oz=value/OZ if unit=='g' and isinstance(value,(int,float)) else value
+                if isinstance(value,bool) or not isinstance(oz,(int,float)) or not math.isfinite(oz) or unit not in ('oz','g') or not s['limits']['min']-1e-9<=oz<=s['limits']['max']+1e-9:
+                    fail(f"Rework must be {s['limits']['min']:.2f}–{s['limits']['max']:.2f} oz net before delivery. Correct the mass and try again.")
             oz, passed = measure(b, 'spotcheck')
             if not passed:
                 move([b], 'finalHold')
@@ -643,6 +938,8 @@ class Store:
                 b['discardReason'] = 'End-of-run reconciliation: '+reason
             move(bs, 'discarded')
             inventory = dict(labels=s['labels'], stations=copy.deepcopy(s['stations']), inTransit=[m for m in s['moves'] if not m['received']])
+            for d in s['deliveries']:
+                if d['status']=='transit':d.update(status='cancelled',cancelledAt=when,cancelledBy=operator)
             s['labels'] = 0
             for st in s['stations']:
                 st['empty'] = 0
@@ -661,6 +958,10 @@ class Store:
             rows = [['event_id', 'run_id', 'utc_time', 'unix_ms', 'operator', 'person_id', 'assigned_roles_json', 'device_id', 'device_name', 'action', 'quantity', 'bag_ids', 'detail', 'submitted_data_json', 'changes_json', 'before_json', 'after_json', 'request_id', 'device_recorded_ms', 'recorded_station']]
             for e in s['events']:
                 rows.append([e['id'], s['runId'], time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(e['at']/1000)), e['at'], e['operator'], e.get('personId',''), json.dumps(e.get('assignments',[])), e.get('deviceId',''), e.get('deviceName',''), e['type'], e['qty'], '|'.join(map(str,e['bags'])), e['detail'], json.dumps(e['data']), json.dumps(e['changes']), json.dumps(e['before']), json.dumps(e['after']), e.get('requestId',''), e.get('recordedAt',''), e.get('recordedStation','')])
+        elif kind == 'deliveries':
+            rows=[['run_id','delivery_id','source','filling_station','quantity','picked_by','person_id','picked_ms','status','delivered_ms','delivered_by','bag_ids_json','remaining_bag_ids_json','receipts_json']]
+            for d in s['deliveries']:
+                rows.append([s['runId'],d['id'],d['source'],d['station'],d['qty'],d['pickedBy'],d.get('personId',''),d['pickedAt'],d['status'],d.get('deliveredAt',''),d.get('deliveredBy',''),json.dumps(d['bagIds']),json.dumps(d['remainingBagIds']),json.dumps(d['receipts'])])
         elif kind == 'people':
             rows = [['run_id','person_id','name','status','assigned_roles_json','updated_ms','last_action_ms','recorded_actions','bags_filled','inspection_readings','rework_readings','final_passes']]
             for p in s['people']:
@@ -678,7 +979,7 @@ class Store:
             rows = [['run_id','bag_id','filling_station','mix_batch','measurement_id','kind','utc_time','operator','entered_value','entered_unit','net_oz','net_g','in_spec']]
             for b in s['bags']:
                 for m in b['measurements']:
-                    rows.append([s['runId'],b['id'],b['station'],b['mixBatch'],m['id'],m['kind'],time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(m['at']/1000)),m['operator'],m['entered'],m['unit'],m['oz'],m['oz']*OZ,s['limits']['min']-1e-9<=m['oz']<=s['limits']['max']+1e-9])
+                    rows.append([s['runId'],b['id'],b['station'],b['mixBatch'],m['id'],m['kind'],time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(m['at']/1000)),m['operator'],m['entered'],m['unit'],m['oz'],m['oz']*OZ,m.get('passed',m.get('minOz',s['limits']['min'])-1e-9<=m['oz']<=m.get('maxOz',s['limits']['max'])+1e-9)])
         elif kind == 'bags':
             rows = [['run_id','bag_id','filling_station','mix_batch','status','created_ms','completed_ms','cycle_seconds','first_weight_failed','seal_failures','replaces','replaced_by']]
             for b in s['bags']:
@@ -835,6 +1136,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/device/hello':
                 self.respond(200, self.server.store.device_hello(req))
                 return
+            if self.path == '/api/actions':
+                self.respond(200, self.server.store.commands(req.get('commands')))
+                return
             if self.path != '/api/action':
                 self.respond(404, {'error':'Not found.'})
                 return
@@ -861,6 +1165,10 @@ def main():
         raise SystemExit('Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN before starting on Render. Local files are not durable on the free plan.')
     store = Store(args.db, os.getenv('TRAILMIX_SAFETY_PIN'),
                   turso_url=turso_url, turso_token=turso_token)
+    if os.getenv('TRAILMIX_UPGRADE_WORKFLOW','1')=='1':
+        store.upgrade_workflow()
+    if os.getenv('TRAILMIX_SEED_ROSTER','1')=='1':
+        store.seed_class_roster()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.store = store
     server.require_access_code = os.getenv('TRAILMIX_REQUIRE_ACCESS_CODE', '0') == '1'
