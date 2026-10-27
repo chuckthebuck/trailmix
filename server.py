@@ -27,7 +27,7 @@ NOW = lambda: int(time.time() * 1000)
 DELIVERY_LEGS = {'labels':('Labeling','Filling','stocker',None),
  'filled':('Filling','First inspection','firstMover','inspectionTransit'),
  'hold':('First inspection','Rework','finalMover','reworkTransit'),
- 'returnReady':('Rework','First inspection','finalMover','returnTransit'),
+ 'returnReady':('Rework','Sealing','finalMover','returnTransit'),
  'ready':('First inspection','Sealing','finalMover','sealTransit'),
  'sealed':('Sealing','Final inspection','finalMover','finalTransit')}
 
@@ -35,6 +35,8 @@ def route_allowed(person, source, station):
     if not person or person.get('deletedAt') or source not in DELIVERY_LEGS:
         return False
     roles=person['assignments']
+    if source not in ('labels','filled'):
+        return DELIVERY_LEGS[source][2] in roles or any(r.startswith('delivery:'+source+':') for r in roles)
     return (DELIVERY_LEGS[source][2] in roles or 'delivery:'+source+':*' in roles or
             'delivery:'+source+':'+str(station) in roles)
 
@@ -43,7 +45,7 @@ QUEUED_ACTIONS = {'routePickup', 'routeDeliver', 'label', 'labelPickup', 'receiv
 CLASS_ROSTER = ['Truus','Leslie','Blake','David','Brian','Aiden','Megan','Fabio','Katelyn','Elias','Halen','Dylan','Luke','Hailey','Marie','Keira','Natalie','Charlie','Beaton','Veena','Nico','Aum','Alexander','Martin','Logan','Lucas','Vito','Sarah']
 SAFETY_ROSTER = {'lucas','blake','charlie'}
 
-STAFF_ACTIONS = {'personDelete', 'personRestore', 'rosterImport', 'personAddMany', 'personAdd', 'personUpdate', 'messagePost', 'messageAcknowledge', 'messageResolve',
+STAFF_ACTIONS = {'assignAtStation', 'configSave', 'personDelete', 'personRestore', 'rosterImport', 'personAddMany', 'personAdd', 'personUpdate', 'messagePost', 'messageAcknowledge', 'messageResolve',
                  'deviceRegister', 'deviceUpdate'}
 
 
@@ -52,7 +54,7 @@ def fresh():
                 started=NOW(), demo=False, limits=dict(min=2.0, max=2.25, confirmed=True),
                 stations=[dict(id=i, empty=0, batch='') for i in range(1, 4)],
                 labels=0, moves=[], bags=[], events=[], next=1, safetyHold=False,
-                people=[], messages=[], devices=[], deliveries=[])
+                people=[], messages=[], devices=[], deliveries=[], configs=[])
 
 
 class Problem(Exception):
@@ -136,6 +138,7 @@ class Store:
         state.setdefault('messages', [])
         state.setdefault('devices', [])
         state.setdefault('deliveries', [])
+        state.setdefault('configs', [])
         return state
 
     @staticmethod
@@ -256,9 +259,26 @@ class Store:
             if action == 'newRun':
                 new = fresh()
                 new['batch'] = args['name'].strip()
-                new['stations'] = [dict(id=st['id'], empty=0, batch='') for st in s['stations']]
-                new['people'] = copy.deepcopy(s['people'])
-                new['devices'] = copy.deepcopy(s['devices'])
+                choice=args.get('configId','current')
+                if choice=='current':
+                    new['stations'] = [dict(id=st['id'], empty=0, batch='') for st in s['stations']]
+                    new['people'] = copy.deepcopy(s['people'])
+                    new['devices'] = copy.deepcopy(s['devices'])
+                else:
+                    definition=next(c for c in s['configs'] if c['id']==choice)['definition']
+                    new['stations']=[dict(id=st['id'],empty=0,batch='') for st in definition['stations']]
+                    new['people']=copy.deepcopy(definition['people'])
+                    for person in new['people']:
+                        previous=next((p for p in s['people'] if p['id']==person['id']),{})
+                        person.update(status='available',updatedAt=when,updatedBy=operator,version=max(person.get('version',0),previous.get('version',0))+1)
+                    new['devices']=copy.deepcopy(definition['devices'])
+                    for device in new['devices']:
+                        previous=next((d for d in s['devices'] if d['id']==device['id']),{})
+                        device.update(version=max(device.get('version',0),previous.get('version',0))+1,updatedAt=when,updatedBy=operator)
+                    for device in s['devices']:
+                        if not any(d['id']==device['id'] for d in new['devices']):
+                            d=copy.deepcopy(device);d.update(personId='',mode='dashboard',version=d.get('version',0)+1);new['devices'].append(d)
+                new['configs']=copy.deepcopy(s['configs'])
                 result['nextRunId'] = new['runId']
             s['revision'] += 1
             payload = {k: v for k, v in args.items() if k != 'safetyPin'}
@@ -289,6 +309,8 @@ class Store:
                     ("UPDATE meta SET value=? WHERE key='current'", (new['runId'],))])
                 s = new
             writes.append(('INSERT INTO requests VALUES (?,?,?)', (request_id, digest, old['runId'])))
+            if action=='routePlanUpgrade':
+                writes.append(("INSERT INTO meta(key,value) VALUES ('direct_sealing_v4','done') ON CONFLICT(key) DO NOTHING",()))
             if action=='workflowUpgrade':
                 writes.append(("INSERT INTO meta(key,value) VALUES ('delivery_limits_v3','done') ON CONFLICT(key) DO NOTHING",()))
             if action=='rosterImport':
@@ -307,6 +329,13 @@ class Store:
         state=self.state()
         return self.command(dict(action='workflowUpgrade',args={},operator='Workflow update',
             requestId='delivery-limits-v3',runId=state['runId'],revision=state['revision']))
+
+    def upgrade_route_plan(self):
+        with self.connect() as db:
+            if db.execute("SELECT value FROM meta WHERE key='direct_sealing_v4'").fetchone():return
+        state=self.state()
+        return self.command(dict(action='routePlanUpgrade',args={},operator='Workflow update',
+            requestId='direct-sealing-v4',runId=state['runId'],revision=state['revision']))
 
     def seed_class_roster(self):
         with self.connect() as db:
@@ -504,7 +533,7 @@ class Store:
             return oz, s['limits']['min'] - 1e-9 <= oz <= s['limits']['max'] + 1e-9
 
         if s.get('safetyHold') and action not in ('workflowUpgrade','safetyRelease', 'note', 'safetyReport', 'spotcheck',
-                'personDelete', 'personRestore', 'rosterImport', 'personAddMany', 'personAdd', 'personUpdate', 'messagePost', 'messageAcknowledge', 'messageResolve',
+                'assignAtStation','configSave','routePlanUpgrade','personDelete', 'personRestore', 'rosterImport', 'personAddMany', 'personAdd', 'personUpdate', 'messagePost', 'messageAcknowledge', 'messageResolve',
                 'deviceRegister', 'deviceUpdate'):
             fail('Production is on a safety hold. Ask the Safety Rover to release it.')
         roles = {'label', 'inspection', 'rework', 'sealing', 'final', 'stocker', 'firstMover',
@@ -548,6 +577,66 @@ class Store:
             return result('Device assignment updated', detail=name, deviceBefore=before,
                           deviceAfter=copy.deepcopy(device), **extra)
 
+        if action=='routePlanUpgrade':
+            changed=[];affected=[]
+            for bag in s['bags']:
+                latest=bag['measurements'][-1] if bag['measurements'] else None
+                if bag['status']=='inspection' and latest and latest['kind']=='rework' and s['limits']['min']-1e-9<=latest['oz']<=s['limits']['max']+1e-9:
+                    bag.update(status='ready',updated=when);affected.append(bag)
+            for person in s['people']:
+                before=copy.deepcopy(person)
+                person['assignments']=list(dict.fromkeys('delivery:'+r.split(':')[1]+':*' if r.startswith('delivery:') and r.split(':')[1] not in ('labels','filled') else r for r in person['assignments']))
+                if person!=before:
+                    person.update(version=person.get('version',0)+1,updatedAt=when,updatedBy=operator)
+                    changed.append(dict(before=before,after=copy.deepcopy(person)))
+            for d in s['deliveries']:
+                if d['status']=='transit' and d['source'] not in ('labels','filled'):d['station']=None
+            return result('Rework route updated',affected,detail='Cleared rework goes directly to Sealing; downstream legs are shared',peopleUpdated=changed)
+        if action in ('assignAtStation','configSave'):
+            coordinator=person_for(operator)
+            if not coordinator or not any(r in coordinator['assignments'] for r in ('coordinator','safety')):
+                fail('Select a coordinator or Safety operator to manage station assignments and saved configurations.')
+        if action=='assignAtStation':
+            role=a.get('stationRole')
+            if role not in {'label','inspection','rework','sealing','final'}|{'fill:'+str(st['id']) for st in s['stations']} and not (role in roles and role.startswith('delivery:')):
+                fail('Choose a production station.')
+            person=next((p for p in s['people'] if p['id']==a.get('person') and not p.get('deletedAt')),None)
+            if not person:fail('Choose an active operator.')
+            if a.get('expectedVersion')!=person.get('version',0):fail('This operator changed elsewhere. Review the current assignment and retry.')
+            changed=[]
+            targets=[person]+([p for p in s['people'] if p['id']!=person['id'] and role in p['assignments']] if a.get('replace') is True else [])
+            for p in targets:
+                before=copy.deepcopy(p)
+                if p['id']==person['id']:
+                    if role not in p['assignments']:p['assignments'].append(role)
+                    p['status']='working'
+                else:p['assignments']=[r for r in p['assignments'] if r!=role]
+                p.update(version=p.get('version',0)+1,updatedAt=when,updatedBy=operator)
+                changed.append(dict(before=before,after=copy.deepcopy(p)))
+            devices=[]
+            if a.get('device'):
+                device=next((d for d in s['devices'] if d['id']==a['device']),None)
+                if not device:fail('Device not found. Open the app on it first.')
+                before=copy.deepcopy(device)
+                device.update(personId=person['id'],mode='delivery' if role.startswith('delivery:') else role,version=device['version']+1,updatedAt=when,updatedBy=operator)
+                devices.append(dict(before=before,after=copy.deepcopy(device)))
+            return result('Station operator assigned',detail=person['name']+' → '+role,peopleUpdated=changed,devicesUpdated=devices)
+        if action=='configSave':
+            name=str(a.get('name','')).strip()
+            if not name or len(name)>100:fail('Enter a configuration name up to 100 characters.')
+            config=next((c for c in s['configs'] if c['name'].casefold()==name.casefold()),None)
+            if config and a.get('expectedVersion')!=config['version']:fail('This saved configuration changed. Review it before overwriting.')
+            if not config and len(s['configs'])>=20:fail('Up to 20 named configurations can be saved.')
+            before=copy.deepcopy(config)
+            definition=dict(stations=[dict(id=st['id']) for st in s['stations']],
+                people=copy.deepcopy([p for p in s['people'] if not p.get('deletedAt')]),
+                devices=copy.deepcopy(s['devices']))
+            if not config:
+                config=dict(id=str(uuid.uuid4()),name=name,createdAt=when,version=0)
+                s['configs'].append(config)
+            else:config['version']+=1
+            config.update(name=name,definition=definition,updatedAt=when,updatedBy=operator)
+            return result('Configuration saved',detail=name,configBefore=before,configAfter=copy.deepcopy(config))
         if action=='workflowUpgrade':
             old_limits=copy.deepcopy(s['limits'])
             affected=[]
@@ -582,7 +671,9 @@ class Store:
         if action=='routePickup':
             source,station=a.get('source'),a.get('station')
             person=person_for(operator)
-            if not route_allowed(person,source,station) or not any(st['id']==station for st in s['stations']):
+            if source not in ('labels','filled'):
+                station=None;a=dict(a,station=None)
+            if not route_allowed(person,source,station) or source in ('labels','filled') and not any(st['id']==station for st in s['stations']):
                 fail('This delivery leg and filling station are not assigned to you.')
             if source=='labels':
                 response=self.apply(s,'labelPickup',a,operator,when)
@@ -605,7 +696,7 @@ class Store:
             bs=[next((b for b in s['bags'] if b['id']==id),None) for id in targets]
             if not bs or any(not b or b['status']!=source for b in bs):
                 fail('Package contents changed. Review this delivery before proceeding.')
-            destinations=dict(inspectionTransit='inspection',reworkTransit='rework',returnTransit='inspection',sealTransit='sealing',finalTransit='final')
+            destinations=dict(inspectionTransit='inspection',reworkTransit='rework',returnTransit='sealing',sealTransit='sealing',finalTransit='final')
             move(bs,destinations[source])
             changes=receipt(bs)
             return result('Route delivered',bs,detail=d['source']+' delivered',deliveryReceipts=changes,qty=len(bs))
@@ -791,14 +882,14 @@ class Store:
             if source in ('returnReady','ready'):
                 kind='rework' if source=='returnReady' else 'inspection'
                 for b in bs:
-                    latest=next((m for m in reversed(b['measurements']) if m['kind']==kind),None)
+                    latest=next((m for m in reversed(b['measurements']) if m['kind']==kind or source=='ready' and m['kind']=='rework'),None)
                     if not latest or not s['limits']['min']-1e-9<=latest['oz']<=s['limits']['max']+1e-9:
                         fail(('Rework' if source=='returnReady' else 'First inspection')+' must be in spec before delivery.')
             move(bs, routes[source])
-            deliveries=[shipment(source,station,[b for b in bs if b['station']==station]) for station in sorted({b['station'] for b in bs})]
+            deliveries=([shipment(source,station,[b for b in bs if b['station']==station]) for station in sorted({b['station'] for b in bs})] if source=='filled' else [shipment(source,None,bs)])
             return result('Transport pickup', bs, source+' → '+routes[source], source=source, destination=routes[source],deliveryIds=[d['id'] for d in deliveries])
         if action == 'receive':
-            routes = dict(inspectionTransit='inspection', reworkTransit='rework', returnTransit='inspection',
+            routes = dict(inspectionTransit='inspection', reworkTransit='rework', returnTransit='sealing',
                           sealTransit='sealing', finalTransit='final')
             source = a.get('source')
             if source not in routes:
@@ -836,7 +927,7 @@ class Store:
                 return result('Weight failed', [b], 'Underweight → rework hold' if oz < s['limits']['min'] else 'Overweight → rework hold', massOz=oz)
             if passed:
                 move([b], 'returnReady')
-                return result('Rework cleared for reinspection', [b], f'{oz:.4f} oz net', massOz=oz)
+                return result('Rework cleared for sealing', [b], f'{oz:.4f} oz net', massOz=oz)
             return result('Rework still out of spec', [b], f'{oz:.4f} oz net', massOz=oz)
         if action in ('seal', 'failSeal'):
             b = bag(['sealing'])
@@ -929,7 +1020,9 @@ class Store:
                 fail('Enter the new run name, up to 100 characters.')
             if any(b['status'] not in ('done', 'discarded') for b in s['bags']) or s['labels'] or any(st['empty'] for st in s['stations']) or any(not m['received'] for m in s['moves']):
                 fail('Account for all bags and empty inventory before archiving. Use a Safety Rover reconciliation.')
-            return result('Run archived', detail='Next run: '+name)
+            choice=a.get('configId','current')
+            if choice!='current' and not any(c['id']==choice for c in s['configs']):fail('Saved configuration not found.')
+            return result('Run archived', detail='Next run: '+name,configuration=choice)
         if action == 'reconcile':
             safety()
             reason = note()
@@ -1167,6 +1260,7 @@ def main():
                   turso_url=turso_url, turso_token=turso_token)
     if os.getenv('TRAILMIX_UPGRADE_WORKFLOW','1')=='1':
         store.upgrade_workflow()
+        store.upgrade_route_plan()
     if os.getenv('TRAILMIX_SEED_ROSTER','1')=='1':
         store.seed_class_roster()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
