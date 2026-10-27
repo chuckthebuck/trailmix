@@ -11,7 +11,7 @@ context=vm.createContext({document,window:{addEventListener(type,fn){if(type==='
 const run=js=>vm.runInContext(js,context);
 run(fs.readFileSync(require('path').join(__dirname,'trailmix.html'),'utf8').match(/<script>([\s\S]*?)<\/script>/)[1]);
 fixed.get('operator').value='Keyboard test';
-run(`state.limits.confirmed=true;state.runId='test';state.labels=12;state.stations.forEach(s=>{s.empty=5;s.batch='MIX-KEY'});state.moves=[{id:100,station:1,qty:3,received:false},{id:101,station:1,qty:4,received:false}];let kbId=1;for(const status of ['filled','inspectionTransit','returnTransit','inspection','hold','ready','reworkTransit','rework','returnReady','sealTransit','sealing','sealed','finalTransit','final'])state.bags.push({id:kbId++,station:1,status,created:1,updated:1,holdAt:1,measurements:[{oz:1.6}],sealFails:0})`);
+run(`state.limits.confirmed=true;state.runId='test';state.labels=12;state.stations.forEach(s=>{s.empty=5;s.batch='MIX-KEY'});state.moves=[{id:100,station:1,qty:3,received:false},{id:101,station:1,qty:4,received:false}];let kbId=1;for(const status of ['filled','inspectionTransit','returnTransit','inspection','hold','ready','reworkTransit','rework','returnReady','sealTransit','sealing','sealed','finalTransit','final'])state.bags.push({id:kbId++,station:1,status,created:1,updated:1,holdAt:1,measurements:[{oz:2.1}],sealFails:0})`);
 function event(key,options={}){return {key,altKey:false,shiftKey:false,ctrlKey:false,metaKey:false,repeat:false,isComposing:false,prevented:false,stopped:false,preventDefault(){this.prevented=true},stopImmediatePropagation(){this.stopped=true},...options}}
 let checked=0;
 for(const mode of ['label','stocker','fill:1','inspection','rework','sealing','final','firstMover','finalMover']){
@@ -58,4 +58,20 @@ document.activeElement=fixed.get('operator');context.testEvent=event('f');run('s
 context.testEvent=event('f',{altKey:true});run('stationKeyboard(testEvent)');assert(context.testEvent.prevented);
 
 run("stationMode='';setupStationKeyboard()");assert.equal(run('stationKeys.size'),0);assert.equal(badges.length,0);
+
+// Station picker defaults to the screen being viewed rather than Labeling.
+run('connected=true');fixed.set('stationChoice',element('select',{id:'stationChoice'}));fixed.get('stationDialog').showModal=()=>{};
+for(const [screen,expected]of [['Inspection','inspection'],['Rework','rework'],['Sealing','sealing'],['Final inspection','final'],['Labeling','label'],['My deliveries','delivery']]){
+ context.screenName=screen;run('page=screenName;openStationPicker()');assert.equal(fixed.get('stationChoice').value,expected);
+}
+// Route descriptions and binding IDs use action, leg and station, not bag counts.
+run(`state.people=[{id:'kb-person',name:'Keyboard test',assignments:['delivery:filled:1','delivery:filled:2','delivery:hold:2'],status:'working'}];state.deliveries=[{id:'package-one',source:'filled',station:2,status:'transit',personId:'kb-person',pickedBy:'Keyboard test',pickedAt:1,remainingBagIds:[2],qty:1}];stationMode='delivery';render()`);
+let route=run("stationControls.find(c=>c.id==='action:routePickup:filled:1')");
+assert(route&&route.title.includes('Filling station 1')&&route.title.includes('inspection'));
+assert(run("stationControls.find(c=>c.id==='action:routePickup:filled:2').title.includes('Filling station 2')"));
+const stableTitle=route.title;run("setKeyBinding('action:routePickup:filled:1','alt+shift+9')");
+run("state.bags.push({id:999,station:1,status:'filled',updated:2,measurements:[]});render()");
+route=run("stationControls.find(c=>c.id==='action:routePickup:filled:1')");assert.equal(route.title,stableTitle);assert.equal(route.key,'alt+shift+9');
+run("setKeyBinding('action:routeDeliver:filled:2','alt+shift+8');state.deliveries[0].id='package-two';render()");
+const delivered=run("stationControls.find(c=>c.id==='action:routeDeliver:filled:2')");assert.equal(delivered.key,'alt+shift+8');assert(delivered.title.includes('Filling station 2'));assert(delivered.el.getAttribute('onclick').includes('package-two'));
 console.log(JSON.stringify({result:'PASS',shortcutControls:checked,stationLayouts:9,typingProtected:true,repeatProtected:true,disabledProtected:true,modalProtected:true,badgesAndAria:true,plainKeys:true,customBindings:true,persistence:true,registeredListenerDispatch:true,shiftedDigitHandling:true}));

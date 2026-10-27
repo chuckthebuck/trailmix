@@ -31,7 +31,7 @@ class ProductionTests(unittest.TestCase):
         self.act('receiveLabels', movement=s['moves'][0]['id'])
         self.act('assignBatch', station=1, batch='MIX-001')
 
-    def inspected(self, mass=1.6, label=True):
+    def inspected(self, mass=2.1, label=True):
         self.stocked()
         s=self.act('fill', station=1)
         b=s['bags'][-1]['id']
@@ -58,8 +58,8 @@ class ProductionTests(unittest.TestCase):
         with self.assertRaises(Problem): self.act('receiveLabels',movement=mid)
         self.assertEqual(self.store.state()['stations'][0]['empty'],4)
 
-    def test_both_over_and_underweight_rework_then_independent_inspection(self):
-        for mass in (1.4,1.8):
+    def test_both_over_and_underweight_rework_then_direct_sealing(self):
+        for mass in (1.9,2.3):
             with self.subTest(mass=mass):
                 # Fresh database for each complete flow.
                 self.store=Store(Path(self.tmp.name)/(str(mass)+'.sqlite3'),'rover-pin')
@@ -68,25 +68,25 @@ class ProductionTests(unittest.TestCase):
                 self.act('move',source='hold',qty=1)
                 self.assertEqual(self.store.state()['bags'][0]['status'],'reworkTransit')
                 self.act('receive',source='reworkTransit',qty=1)
-                s=self.act('clear',bag=bid,mass=1.9,unit='oz')
-                self.assertEqual(s['bags'][0]['status'],'rework')
-                s=self.act('clear',bag=bid,mass=1.6,unit='oz')
+                with self.assertRaisesRegex(Problem,'before delivery'):self.act('clear',bag=bid,mass=2.4,unit='oz')
+                self.assertEqual(self.store.state()['bags'][0]['status'],'rework')
+                s=self.act('clear',bag=bid,mass=2.1,unit='oz')
                 self.assertEqual(s['bags'][0]['status'],'returnReady')
                 with self.assertRaises(Problem): self.act('seal',bag=bid)
                 self.act('move',source='returnReady',qty=1)
-                self.act('receive',source='returnTransit',qty=1)
-                s=self.act('weigh',bag=bid,mass=1.6,unit='oz',labelOK=True)
-                self.assertEqual(s['bags'][0]['status'],'ready')
-                self.assertEqual(len(s['bags'][0]['measurements']),4)
+                s=self.act('receive',source='returnTransit',qty=1)
+                self.assertEqual(s['bags'][0]['status'],'sealing')
+                with self.assertRaises(Problem):self.act('weigh',bag=bid,mass=2.1,unit='oz',labelOK=True)
+                self.assertEqual(len(s['bags'][0]['measurements']),2)
                 self.assertTrue(s['bags'][0]['firstFail'])
 
     def test_label_failure_is_discarded_even_if_also_underweight(self):
-        self.inspected(1.4,False)
+        self.inspected(1.9,False)
         self.assertEqual(self.store.state()['bags'][0]['status'],'discarded')
         with self.assertRaises(Problem): self.act('move',source='hold',qty=1)
 
     def test_gram_conversion_and_inclusive_boundaries(self):
-        for oz in (1.5,1.75):
+        for oz in (2.0,2.25):
             self.store=Store(Path(self.tmp.name)/(str(oz)+'.sqlite3'),'rover-pin')
             self.stocked(1)
             bid=self.act('fill',station=1)['bags'][0]['id']
@@ -139,7 +139,7 @@ class ProductionTests(unittest.TestCase):
         self.act('label',qty=1)
 
     def test_archives_exports_append_only_and_no_pin_in_history(self):
-        self.inspected(1.4)
+        self.inspected(1.9)
         before=self.store.state()
         self.act('reconcile',note='remaining product discarded, empty bags returned',safetyPin='rover-pin')
         self.act('newRun',name='Run 02',safetyPin='rover-pin')
@@ -162,11 +162,11 @@ class ProductionTests(unittest.TestCase):
         self.act('move',source='filled',qty=2)
         s=self.act('receive',source='inspectionTransit',qty=2)
         ids=[b['id'] for b in s['bags']]
-        for bid in ids: self.act('weigh',bag=bid,mass=1.3,unit='oz',labelOK=True)
+        for bid in ids: self.act('weigh',bag=bid,mass=1.8,unit='oz',labelOK=True)
         self.act('move',source='hold',qty=2)
         self.act('receive',source='reworkTransit',qty=2)
         old=self.store.state()
-        with self.assertRaises(Problem): self.act('clear',bag=ids[1],mass=1.6,unit='oz')
+        with self.assertRaises(Problem): self.act('clear',bag=ids[1],mass=2.1,unit='oz')
         self.assertEqual(old,self.store.state())
 
     def test_csv_formula_safety_and_rebag_lineage(self):

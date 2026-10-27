@@ -1,0 +1,29 @@
+Direct rework to Sealing, saved configurations and station-page assignment
+
+Let pending saves finish. Deploy server.py, turso_db.py and trailmix.html
+together, then refresh all station browsers. Keep existing database and Safety
+PIN settings. No paid service or extra database setup is required.
+
+Cleared rework now goes directly to Sealing. Only Labeling → Filling and
+Filling → First inspection have filling-station choices. Downstream legs are
+shared routes without filling-origin labels. Bag history still retains origin.
+The startup upgrade consolidates old downstream assignments. Cleared rework
+already in transit is delivered to Sealing under the updated plan. Cleared
+rework already returned to Inspection becomes ready for Sealing pickup.
+
+Settings → Saved configurations saves named setups (Coordinator / Safety role).
+The snapshot includes people, station / delivery assignments, station definitions
+and device assignments. At End this run → Setup for next run, choose Keep
+current setup or a saved setup. The next run starts with empty inventory, queues
+and mixing batch IDs; old production records remain archived. Configuration
+snapshots do not contain Safety PINs or session credentials.
+
+A collapsed Coordinator assignment panel is available on actual station pages,
+including station mode. Choose a person and optionally replace the existing
+assignment or also assign this device. Delivery pages include a leg selector.
+Assignments are logged and unfinished weight entry is preserved.
+
+Validation: 75 backend tests plus keyboard and local HTTP workflows passed,
+including direct rework, shared mixed-origin packages, named configuration
+reloads, new-run resets, coordinator assignments, saved remote setups and retries.
+Live cloud deployment and full-browser visual rendering were not tested here.

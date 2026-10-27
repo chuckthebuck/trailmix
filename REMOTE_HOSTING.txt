@@ -35,7 +35,6 @@ At https://dashboard.render.com choose New > Blueprint, connect the repository,
 and use render.yaml at its root. Enter these four environment variables:
   TURSO_DATABASE_URL       Your database base URL, not a pipeline endpoint
   TURSO_AUTH_TOKEN         Your database read/write token
-  TRAILMIX_ACCESS_CODE     A long private code shared with operators
   TRAILMIX_SAFETY_PIN      A separate private Safety Rover code
 
 The Blueprint also sets TRAILMIX_HTTPS=1 for secure cookies and plan: free.
@@ -85,8 +84,9 @@ is missing on Render. Local runs without Turso variables still use SQLite at
 data/trailmix.sqlite3. Set both Turso variables to opt into remote storage.
 
 One remote transaction saves the run state, event and idempotency request record
-together. A database interruption leaves the save pending. Use Retry the same
-save and do not repeat the physical operation. If the original commit succeeded
+together. Station mode responds locally and saves through an ordered browser
+queue. A database interruption pauses the queue. Use Retry saved entries and do
+not repeat the physical operation. Other screens see confirmed counts. If the original commit succeeded
 but its confirmation was lost, retry returns it without recording a duplicate.
 Keep the tab open until resolved. Transactions have short provider timeouts, so
 network latency can cause retries. Only one backend should write this database.
@@ -117,3 +117,11 @@ Local SQLite tests, remote HTTP protocol tests using a local SQLite gateway,
 keyboard checks, and the live application workflow pass. A live Turso deployment
 has not been tested with user credentials, and real browser visual checks remain
 necessary on your station devices. No paid resources have been provisioned.
+
+ACCESS UPDATE
+The app opens without a team code by default. Existing access-code variables
+can be left in Render but do not enable sign-in on their own. Set
+TRAILMIX_REQUIRE_ACCESS_CODE=1 only if you want optional team-code sign-in.
+Set TRAILMIX_SAFETY_PIN to the current Safety PIN before updating to preserve
+that exact value. The PIN is saved in Turso and remains consistent after
+restarts. Without an explicit PIN, one is generated once and saved.

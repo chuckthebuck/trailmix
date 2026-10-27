@@ -24,6 +24,7 @@ class Gateway(BaseHTTPRequestHandler):
         if self.headers.get('Authorization') != 'Bearer test-db-token':
             self.send_error(401)
             return
+        self.server.request_count += 1
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         baton = body.get('baton') or str(uuid.uuid4())
         if baton not in self.server.connections:
@@ -76,6 +77,7 @@ class TursoTests(unittest.TestCase):
         self.gateway = ThreadingHTTPServer(('127.0.0.1',0),Gateway)
         self.gateway.path = str(Path(self.tmp.name)/'remote.sqlite3')
         self.gateway.connections = {}
+        self.gateway.request_count = 0
         self.gateway.fail_update = self.gateway.drop_commit = False
         threading.Thread(target=self.gateway.serve_forever,daemon=True).start()
         opener = GatewayOpener('http://127.0.0.1:'+str(self.gateway.server_port))
@@ -102,20 +104,104 @@ class TursoTests(unittest.TestCase):
     def act(self, action, **args):
         return self.store.command(self.req(action,**args))['state']
 
+    def test_label_save_uses_three_round_trips_and_retry_uses_two(self):
+        request = self.req('label', qty=5)
+        start = self.gateway.request_count
+        response = self.store.command(request)
+        self.assertEqual(self.gateway.request_count - start, 3)
+        self.assertEqual(response['state']['labels'], 5)
+        start = self.gateway.request_count
+        retry = self.store.command(request)
+        self.assertEqual(self.gateway.request_count - start, 2)
+        self.assertTrue(retry['duplicate'])
+        self.assertEqual(len(retry['state']['events']), 1)
+        start = self.gateway.request_count
+        self.assertEqual(self.store.state()['labels'], 5)
+        self.assertEqual(self.gateway.request_count - start, 0)
+        self.assertEqual(self.gateway.connections, {})
+
+    def test_connected_screens_share_an_immutable_committed_snapshot(self):
+        self.act('label', qty=7)
+        start = self.gateway.request_count
+        for _ in range(20):
+            snapshot = self.store.state()
+            snapshot['labels'] = 999
+            snapshot['stations'][0]['empty'] = 999
+        self.assertEqual(self.gateway.request_count, start)
+        self.assertEqual(self.store.state()['labels'], 7)
+        self.assertEqual(self.store.state()['stations'][0]['empty'], 0)
+
+    def test_remote_pin_and_session_secret_persist_without_environment_values(self):
+        first = server.Store(self.store.path, turso_url='libsql://database.test',turso_token='test-db-token')
+        again = server.Store(self.store.path, turso_url='libsql://database.test',turso_token='test-db-token')
+        self.assertEqual(first.safety_pin, 'rover-pin')
+        self.assertEqual(first.safety_pin, again.safety_pin)
+        self.assertEqual(first.auth_cookie, again.auth_cookie)
+        self.assertNotIn(first.safety_pin, again.export('json')[1].decode())
+
+    def test_fifty_action_batch_uses_three_database_trips_and_lost_commit_is_safe(self):
+        self.stocked(50)
+        state=self.store.state()
+        batch=[dict(action='fill',args={'station':1,'mixBatch':'MIX-001'},operator='Batch tester',
+                    requestId=str(uuid.uuid4()),runId=state['runId'],revision=state['revision'],queued=True) for _ in range(50)]
+        start=self.gateway.request_count
+        self.gateway.drop_commit=True
+        with self.assertRaises(RemoteDatabaseError):self.store.commands(batch)
+        self.assertEqual(self.gateway.request_count-start,3)
+        start=self.gateway.request_count
+        result=self.store.commands(batch)
+        self.assertEqual(self.gateway.request_count-start,3)
+        self.assertEqual(len(result['state']['bags']),50)
+        self.assertTrue(all(r['duplicate'] for r in result['results']))
+
+    def test_batch_failure_after_event_inserts_rolls_back_all_rows(self):
+        state=self.store.state()
+        batch=[dict(action='label',args={'qty':1},operator='Batch tester',requestId=str(uuid.uuid4()),
+                    runId=state['runId'],revision=state['revision'],queued=True) for _ in range(4)]
+        self.gateway.fail_update=True
+        with self.assertRaises(RemoteDatabaseError):self.store.commands(batch)
+        self.assertEqual(self.store.state()['labels'],0)
+        self.assertEqual(len(self.store.commands(batch)['state']['events']),4)
+
+    def test_route_packages_and_receipts_survive_a_lost_batch_commit(self):
+        self.act('personAdd',name='Remote stocker',assignments=['delivery:labels:2'])
+        self.act('label',qty=3)
+        state=self.store.state()
+        pickup=dict(action='routePickup',args={'source':'labels','station':2,'qty':3},operator='Remote stocker',requestId=str(uuid.uuid4()),runId=state['runId'],revision=state['revision'],queued=True)
+        delivered=dict(action='routeDeliver',args={'delivery':'pending-'+pickup['requestId']},operator='Remote stocker',requestId=str(uuid.uuid4()),runId=state['runId'],revision=state['revision'],queued=True)
+        start=self.gateway.request_count;self.gateway.drop_commit=True
+        with self.assertRaises(RemoteDatabaseError):self.store.commands([pickup,delivered])
+        self.assertEqual(self.gateway.request_count-start,3)
+        result=self.store.commands([pickup,delivered])
+        self.assertTrue(all(r['duplicate'] for r in result['results']))
+        self.assertEqual(len(result['state']['deliveries']),1)
+        self.assertEqual(result['state']['deliveries'][0]['status'],'delivered')
+        self.assertEqual(result['state']['stations'][1]['empty'],3)
+
+    def test_saved_configuration_and_route_migration_persist_remotely(self):
+        self.act('personAdd',name='Remote coordinator',assignments=['coordinator','delivery:hold:1'])
+        self.store.upgrade_route_plan()
+        request=self.req('configSave',name='Remote saved setup');request['operator']='Remote coordinator'
+        config=self.store.command(request)['state']['configs'][0]
+        restarted=self.reopen()
+        self.assertEqual(restarted.state()['configs'][0]['id'],config['id'])
+        self.assertIn('delivery:hold:*',restarted.state()['people'][0]['assignments'])
+        count=len(restarted.state()['events']);restarted.upgrade_route_plan()
+        self.assertEqual(len(restarted.state()['events']),count)
+        self.act('newRun',name='Saved remote run',configId=config['id'],safetyPin='rover-pin')
+        self.assertEqual(self.reopen().state()['configs'][0]['id'],config['id'])
+
     def test_remote_rework_inspection_and_sealing_flow(self):
         self.stocked(1)
         self.act('fill',station=1)
         self.act('move',source='filled',qty=1)
         bag = self.act('receive',source='inspectionTransit',qty=1)['bags'][0]['id']
-        self.act('weigh',bag=bag,mass=1.9,unit='oz',labelOK=True)
+        self.act('weigh',bag=bag,mass=2.4,unit='oz',labelOK=True)
         self.act('move',source='hold',qty=1)
         self.act('receive',source='reworkTransit',qty=1)
-        self.act('clear',bag=bag,mass=1.6,unit='oz')
+        self.act('clear',bag=bag,mass=2.1,unit='oz')
         self.act('move',source='returnReady',qty=1)
         self.act('receive',source='returnTransit',qty=1)
-        self.act('weigh',bag=bag,mass=1.6,unit='oz',labelOK=True)
-        self.act('move',source='ready',qty=1)
-        self.act('receive',source='sealTransit',qty=1)
         self.act('seal',bag=bag)
         self.assertEqual(self.store.state()['bags'][0]['status'],'sealed')
         self.assertFalse(Path(self.store.path).exists())
@@ -159,5 +245,5 @@ class TursoTests(unittest.TestCase):
         with self.assertRaises(ValueError): server.Store('unused','pin',turso_url='libsql://db.test')
         for url in ('http://db.test','https://user:secret@db.test','https://db.test?token=secret'):
             with self.assertRaises(ValueError): TursoConnection(url,'token')
-        for value in (None,2**60,1.6,'word',b'bytes'):
+        for value in (None,2**60,2.1,'word',b'bytes'):
             self.assertEqual(decode(encode(value)),value)

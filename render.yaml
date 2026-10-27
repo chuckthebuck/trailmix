@@ -18,7 +18,7 @@ services:
         sync: false
       - key: TRAILMIX_HTTPS
         value: "1"
-      - key: TRAILMIX_ACCESS_CODE
-        sync: false
+      - key: TRAILMIX_REQUIRE_ACCESS_CODE
+        value: "0"
       - key: TRAILMIX_SAFETY_PIN
         sync: false

@@ -7,7 +7,7 @@ The local SQLite instructions below still apply when running on your own PC.
 
 A browser-based production tracker for the supplied Trail Mix Project SOP,
 with the requested amendment: both underweight and overweight bags go to
-weight rework. Rework clearance always requires a return to First Inspection.
+weight rework. Valid rework clearance sends the bag directly to Sealing.
 
 QUICK START ON WINDOWS
 
@@ -16,8 +16,8 @@ QUICK START ON WINDOWS
    packages are needed. The station devices need only their web browsers.
 3. Double-click START_WINDOWS.bat. Leave that window and computer running.
 4. Open http://localhost:8080 on the server computer.
-5. Enter the team access code printed in the server window, then your name.
-   Keep the separately printed Safety Rover PIN with Safety personnel.
+5. The app opens directly. Enter your operator name. Set TRAILMIX_SAFETY_PIN
+   to your chosen Safety Rover PIN; it is saved and reused across restarts.
 6. On other devices on the same network, open http://SERVER-IP:8080, replacing
    SERVER-IP with this computer's local IPv4 address (shown by Windows ipconfig).
    If Windows asks about network access, allow it on the trusted private network.
@@ -47,7 +47,7 @@ shows only the selected station's bag inventory, fill button, pickup quantity,
 and mixing batch assignment (collapsed after assignment). Inspection, Rework,
 Sealing, and Final Inspection show one bag at a time. Each station also has
 its own incoming receipt and outgoing pickup buttons, including both Inspection
-outputs, the return from Rework, and Sealing to Final Inspection. Bag Stocker, First
+outputs, Rework to Sealing, and Sealing to Final Inspection. Bag Stocker, First
 Inspection Mover, and Final Mover have their own optional handoff controls. The operator
 name, connection status, and Report safety issue remain available.
 
@@ -77,14 +77,14 @@ needed; it marks the current bag as a label failure, and Record mass discards
 that bag. Undo label failure clears the mark before submission. The mark resets
 for the next bag. A label check result is still logged on every inspection.
 
-Enter submits a weight reading in Inspection or Rework, including station mode.
-The cursor returns to the empty weight box for the next bag after a successful
-save, when a bag is available and the operator name has been entered. Changing
-mass units or marking a label failure also returns focus to the weight box.
-Background updates wait while a mass is partly entered; they can refresh an
-empty focused weight box to show newly received bags. Another active input,
-including operator name, is not interrupted. A failed or unconfirmed save never
-advances the bag. Verify any stale-data conflict before re-entering a reading.
+Enter submits a weight reading in Inspection or Rework. In station mode the
+reading is retained locally, the queue advances immediately, and focus returns
+to the empty weight field for the next bag. Saving occurs in the background.
+A save returning preserves the next partly entered weight. Label checks still
+reset to pass for the next bag. The pending status distinguishes local entries
+from server-confirmed counts. Keep this device open until saves finish.
+
+Full production pages use the same local queue and immediate feedback as station mode.
 
 OPERATOR ASSIGNMENTS AND MESSAGES
 
@@ -92,7 +92,7 @@ Open Operators to add each person with a distinct name. Select Manage to assign
 one or more jobs (for example Bag Stocker plus First Inspection Mover), and set
 Available, Working, Break, or Off. People choose their roster name in the operator
 name field on their device. Assignments and messages appear above their station
-controls. Assignment management uses the existing team access code; individual
+controls. Assignment management opens without a team code by default; individual
 operator names remain self-reported rather than separate authenticated accounts.
 
 The roster distinguishes assigned roles from last recorded action and location.
@@ -170,13 +170,13 @@ Labeling: add labeled empty bags; record a quantity picked up for a station.
 Filling: receive that delivery, assign the mixing batch ID printed on the tub,
 then tap Filled 1 bag for each bag. Pickup starts the trip to First Inspection.
 Inspection: receive incoming bags, enter NET mass in oz or g, and record the
-label check. Accepted net range is 1.50 through 1.75 oz, inclusive. Use an empty
+label check. Accepted net range is 2.00 through 2.25 oz, inclusive. Use an empty
 labeled bag to tare the scale. Weight failures are held at inspection; label
 failures are discarded, including bags with both a label and weight problem.
 Rework: pickup and receive the held batch. Adjust high or low mass, record each
 reading, then clear in FIFO order when within range. Cleared bags wait for a
-pickup back to First Inspection. They cannot go directly to Sealing.
-Sealing: receive only bags released by First Inspection; record sealed or failed
+pickup directly to Sealing. No return inspection is required.
+Sealing: receive bags released by First Inspection or cleared by Rework; record sealed or failed
 seal. Failed seals require Safety Rover disposition before another attempt.
 All pickup quantities default to the entire ready quantity at their source,
 including labeling, each individual filling station, inspection, rework, and
@@ -257,16 +257,27 @@ entered masses and other active fields. Local display clocks do not make HTTP
 requests. Interrupted live connections reconnect automatically; a Reconnect
 button is also available. Native EventSource support is required for live updates.
 
-If another production action changes the run before a save, the server rejects
-the stale action and loads current data. Review the queue and re-enter the
-reading or quantity before retrying. Assignment/message-only changes do not
-invalidate an entered production reading.
+Station mode retains an ordered queue in browser storage, including original
+operator, device, action ID, selected bags, and entry time. Other station updates
+do not invalidate a queued reading, but the server still checks bag state,
+weight limits, mixing batches, inventory and safety holds. Delivery actions must
+match the exact bags selected. No new entries are accepted once a save fails.
 
-No offline write queue is used. If a save's response is lost, use Retry the same
-save and do not repeat the physical operation. Request IDs prevent duplicate
-records if the original save succeeded. Keep that browser tab open until the save
-is resolved. After an interrupted/reloaded tab, check Activity before repeating
-an action whose outcome is uncertain. Local SQLite survives local server restarts. Hosted Turso records survive Render restarts.
+Keep the browser open until the pending count is zero. After a reload, use Retry
+saved entries before continuing. A lost response is retried with its original ID
+without duplicating committed actions. Browser storage is not a backup; clearing
+it deletes entries that have not reached the server. Confirmed records remain in
+SQLite locally or Turso remotely.
+
+A server-rejected entry can be reviewed after checking the physical bags. Record
+review & clear held entries records all held entries and the correction reason
+in the activity log before clearing them. It does not change production counts.
+An unknown outcome cannot be cleared this way until a retry establishes status.
+Anyone can still report a safety issue while station saves are pending.
+
+Connected displays share one committed server snapshot. Ordinary saves use three
+remote database round trips. Use one backend instance and do not edit production
+data directly in Turso; the running server owns its live snapshot.
 
 At run end, Safety reconciles unfinished product and remaining empty inventory.
 The reconciliation records all unfinished filled bags as discarded and records
@@ -286,9 +297,13 @@ JSON exports support analysis; a JSON import/restore UI is not implemented.
 
 OPTIONAL CONFIGURATION
 
-TRAILMIX_ACCESS_CODE sets a stable team access code; otherwise a new random code
-is printed each time the server starts. TRAILMIX_SAFETY_PIN similarly sets a
-stable Safety PIN. Existing browser sessions must reconnect after a restart.
+Team-code sign-in is disabled by default. Set TRAILMIX_REQUIRE_ACCESS_CODE=1
+and TRAILMIX_ACCESS_CODE only if you want to enable it. Optional browser login
+cookies are saved in the database and remain valid after restarts.
+TRAILMIX_SAFETY_PIN sets the Safety PIN and saves it in the database. Without an
+environment PIN, a PIN is generated once and printed on first startup, then
+reused from the database. Set the current PIN before updating from an older
+version if you want to preserve that exact value.
 TRAILMIX_DB sets the database path; --db also sets it. --port or PORT sets the
 port; the default is 8080. Bind defaults to 0.0.0.0 for access from station devices.
 
@@ -312,8 +327,7 @@ Optional live workflow harness: node test_workflow.cjs. This WRITES test records
 use only a disposable server/database on port 8081 with test team code
 "test-access" and test Safety PIN "123456". TRAILMIX_TEST_URL can change its URL.
 Never run that workflow harness against a real production database.
-The included tests cover inventory, handoffs, high/low rework, independent return
-inspection, label disposal, mass conversion, inclusive limits, duplicate saves,
+The included tests cover inventory, handoffs, high/low rework and direct delivery to Sealing, label disposal, mass conversion, inclusive limits, duplicate saves,
 concurrent write conflicts, Safety controls, final checks, rebag lineage, append-
 only records, archives, persistence, devices, authenticated live updates, remote HTTP transactions, and
 CSV formula protection.
@@ -322,3 +336,47 @@ Frontend syntax and live HTTP/DOM-flow checks were performed. A full Chromium
 visual check could not be run in the build environment because downloading the
 browser was blocked. Validate the layout and network access on your station
 devices during a practice run before using it for production records.
+
+PREPARING THE ROSTER
+Use Operators before production starts. Add one name with initial role choices,
+or add several names (one per line) and preassign their roles together. Use
+Manage assignments for individual changes. The roster, combined assignments,
+and filling-station definitions carry into the next run and survive restarts.
+Devices do not need to be connected when you prepare people.
+
+BATCHED SAVES
+All production pages send up to 50 queued actions per batch, keeping a separate
+audit record for each entry. The server commits the group atomically in three
+remote database round trips. A backlog is combined into subsequent batches
+instead of waiting for each bag separately.
+
+PERSONAL ROUTES
+Assign delivery legs per filling station in Operators. Broad mover roles grant
+all corresponding legs; clear them when restricting a person to exact stations.
+My deliveries and the delivery station modes show that person's assigned pickups
+and their own packages. Picked up and Delivered are separate logged actions.
+Delivery receives the selected package, not an older package from someone else.
+Station receipt controls update the same package ledger. Delivery CSV is available.
+
+WEIGHT VALIDATION
+The current band is 2.00–2.25 oz net. Deployment updates the active run once;
+archives and past reading results retain their original limits. Out-of-spec
+rework cannot be queued, cleared or delivered. Correct the mass in the retained
+field before submitting. Independent first inspection is still required.
+
+SHORTCUTS AND STATION PICKER
+The station picker defaults to the page currently shown. Shortcut descriptions
+use action, leg and filling station, rather than changing bag-count labels.
+
+SAVED CONFIGURATIONS
+Coordinators and Safety operators can save named setups in Settings. Choose
+Keep current setup or a saved setup when starting the next run. People, roles,
+stations and device assignments are retained; inventory, mixing batch IDs,
+bags and event queues start fresh. Existing run history stays archived.
+
+ON-PAGE COORDINATOR ASSIGNMENT
+Coordinator / Safety roster names see a collapsed assignment panel on station
+pages and station mode. Select a person; optionally replace current occupants
+and set this device to that person. Delivery pages offer a leg selector.
+Only the Labeling/Filling legs have per-filling-station choices. Downstream
+routes are shared and do not display filling-origin tags.
