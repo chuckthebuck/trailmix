@@ -1,148 +1,76 @@
-FREE REMOTE HOSTING: GITHUB + RENDER FREE + TURSO FREE
+TRAILMIX GO: EXISTING RENDER + TURSO SERVICE
 
-GitHub holds the source. Render Free runs the app. Turso Free libSQL holds the
-production records. Every station uses one Render HTTPS URL. No paid disk is
-needed and no data is stored on Render's temporary local filesystem.
-No accounts or live deployments have been created by this package.
+DEPLOYMENT
+1. Let browser outboxes finish, then download a full JSON export as a backup.
+2. Replace the complete project contents at the existing GitHub repository root.
+   Required build files: Dockerfile, go.mod, every .go file, testdata/ and
+   trailmix.html. Include the supplied CI files and documentation as well.
+3. Keep existing TURSO_DATABASE_URL and TURSO_AUTH_TOKEN values. The token is a
+   database read/write token, never a public browser credential. Keep existing
+   TRAILMIX_SAFETY_PIN and optional team sign-in settings unchanged.
+4. Use the Docker runtime and supplied Dockerfile. It runs the Go behavior tests,
+   compiles a static binary and copies it and CA certificates into an otherwise
+   empty runtime image. No Python interpreter, writable disk or local replica is
+   used in production. Health check: /healthz. Listen port: Render's PORT.
+5. Keep one instance. Suggested runtime settings in render.yaml are
+   GOMAXPROCS=1 and GOMEMLIMIT=384MiB for a 512 MB service. GOMEMLIMIT is a soft
+   Go runtime memory target, not a guarantee of total process memory usage.
+6. Wait for the log 'TrailMix Go is running', then refresh every browser. The
+   response header X-TrailMix-Backend: go-normalized-v1 verifies the new runtime.
 
-1. CREATE A TURSO LIBSQL DATABASE
-Sign up at https://app.turso.tech on the Free plan. Create a database named
-trailmix using the libSQL engine, which supports the SQLite tables and audit
-triggers in this app. Do not select the newer Turso engine for this release.
-Copy the database URL (libsql://... or https://...) and generate a read/write
-DATABASE token. A Turso account-management API token is not the database token.
-Keep the token private. Never upload it to GitHub or send it to station browsers.
-The app creates its tables automatically on first startup.
+FIRST STARTUP / DATA SAFETY
+Go reads the existing database, including both plain JSON and zlib-v1 snapshots.
+Migration creates normalized tm_runs/tm_entities records and a separate audit
+summary/request-result index. Existing append-only events and request digests
+are preserved. Safety PIN, optional sign-in cookie, current run, roster,
+configurations, in-transit packages, assignments, inventories and readings are
+retained. Prior archived runs remain exportable. No manually entered migration
+SQL, reset, or new database is needed.
 
-If using the Turso CLI, after installation and login:
-  turso db create trailmix
-  turso db show trailmix --url
-  turso db tokens create trailmix
-Omit --tursodb: that flag selects the newer engine instead of libSQL.
-Windows CLI installation instructions use WSL; the dashboard avoids installing
-CLI tools on station devices. See https://docs.turso.tech/quickstart
+The migration commits atomically before the service starts accepting requests.
+An interrupted migration can be restarted. After migration, old runs snapshots
+are read-only so an older Python process cannot overwrite current Go data. The
+old process may reject writes briefly during a rolling deployment; keep pending
+entries and retry after the new service is ready. Do not re-enter physical work.
+Do not roll back to Python after Go begins saving. Original snapshots remain as
+historical migration sources, not current writable state.
 
-2. UPLOAD THE APP TO GITHUB
-Extract the ZIP. Upload the CONTENTS of trailmix-production-desk to the root of
-an empty repository, including .github, .gitignore, server.py, turso_db.py,
-trailmix.html, render.yaml, and the supplied documentation/tests.
-Do not upload the ZIP itself, operational databases, exports, backups or secrets.
-The repository can be private. GitHub Actions checks the code; it does not host
-or store production records.
+SAVE AND SYNC DESIGN
+Normal saves read a small run revision plus matching request IDs. Only changed
+current records and new audit events are written. Up to 50 queued actions commit
+as one transaction with independent request IDs/audit events. New/mixed batches
+use three remote round trips. Fully duplicate batches use two and write nothing.
+SQL error or invalid action rolls back the complete batch. An unknown commit
+outcome invalidates the cache; retry reads confirmed database state and retains
+original IDs. No committed state is published speculatively.
 
-3. DEPLOY A FREE RENDER WEB SERVICE
-At https://dashboard.render.com choose New > Blueprint, connect the repository,
-and use render.yaml at its root. Enter these four environment variables:
-  TURSO_DATABASE_URL       Your database base URL, not a pipeline endpoint
-  TURSO_AUTH_TOKEN         Your database read/write token
-  TRAILMIX_SAFETY_PIN      A separate private Safety Rover code
+Browsers initially receive current data and activity summaries. Later saves and
+SSE updates carry revisioned patches. Missed revisions are recovered by fetching
+confirmed state. Personal route assignment rules and package ownership still
+apply. Before/after bag snapshots live in audit storage and full JSON/CSV exports.
+SSE pings carry presence data, not the whole run. Health probes do not load history.
+Old HTML clients are supported during rollout, but continue receiving larger
+compatibility responses until refreshed.
 
-The Blueprint also sets TRAILMIX_HTTPS=1 for secure cookies and plan: free.
-Confirm the proposed service is Free, has no disk, and creates no Render Postgres
-service. Keep provider plans Free; avoid enabling paid overages. Check current
-usage limits at https://render.com/docs/free and https://turso.tech/pricing
-before accepting any signup/billing choices. Deploy and open the HTTPS URL.
+LOGS
+Batch saved includes save_seconds, database_trips and database_request_bytes.
+HTTP acknowledgements also include lock/read/apply/encode/write/commit/publish
+phase durations under timings. Go does not report Python's thread CPU counter.
+Remote phases include transport/provider processing; they are not pure SQL
+execution times. These measurements do not include all browser download time.
 
-If you already created a Blueprint from the earlier paid-disk package, do not
-assume uploading new YAML removes its existing disk or billing. The simplest
-route for an unused installation is a NEW Free web service connected to this
-repository, with the four variables above and start command python -u server.py.
-An existing billed service/disk must be managed separately in Render's dashboard.
-Do not delete any disk containing records before making and verifying a backup.
-This app does not transfer an existing local/Render SQLite database automatically.
+AUTHENTICATION
+Team login remains optional. Set TRAILMIX_REQUIRE_ACCESS_CODE=1 together with
+TRAILMIX_ACCESS_CODE to require it; otherwise no session login is needed.
+TRAILMIX_HTTPS=1 secures optional sign-in cookies. Safety decisions still require
+the persisted Safety PIN. An explicit TRAILMIX_SAFETY_PIN overrides/persists it.
+The database URL/token and Safety PIN are never included in state or exports.
+Coordinator permissions use roster roles, matching the existing team workflow.
 
-4. CONNECT AND VERIFY
-Open the same HTTPS URL on every station and projector. Enter the team code and
-name. A browser appears under Devices after connecting. Name it and assign its
-operator and station. Different browser profiles are separate identities; tabs
-in one profile share an identity. No campus network scanning is involved.
-
-Before the production session, make a practice run with two devices. Check
-updates, weight entry, keyboard binds, deliveries, and exports. Restart Render,
-reconnect, and verify the records persist in Turso. Do not treat local test-suite
-success as verification of your actual cloud credentials or campus connection.
-
-FREE-TIER LIMITATIONS
-Render Free sleeps after 15 minutes without incoming traffic. Waking can take
-about one minute. Outgoing SSE keepalives do not guarantee the service stays
-awake. Render can also restart a Free service; enter the team code again after
-restarts. Database records remain in Turso independently of Render restarts.
-Render explicitly recommends paid services for production reliability. This
-free configuration is a best-effort option for the classroom project, with no
-uptime guarantee. Start and test it before the session, and keep a paper fallback.
-
-Free tiers have storage, requests, runtime and bandwidth limits. An exhausted
-quota can stop saves or availability. Render also limits unusually high outgoing
-traffic, including external database access. Keep exports/backups so records are
-not dependent on ongoing free-tier availability. Monitor each provider's usage.
-Render's free PostgreSQL database expires after 30 days; this app does not use it.
-
-DATA AND SAVES
-The hosted app connects directly to Turso SQL over HTTPS. It does not use a local
-SQLite replica, and it never falls back to temporary storage when remote config
-is missing on Render. Local runs without Turso variables still use SQLite at
-data/trailmix.sqlite3. Set both Turso variables to opt into remote storage.
-
-One remote transaction saves the run state, event and idempotency request record
-together. Station mode responds locally and saves through an ordered browser
-queue. A database interruption pauses the queue. Use Retry saved entries and do
-not repeat the physical operation. Other screens see confirmed counts. If the original commit succeeded
-but its confirmation was lost, retry returns it without recording a duplicate.
-Keep the tab open until resolved. Transactions have short provider timeouts, so
-network latency can cause retries. Only one backend should write this database.
-
-After sign-in, one SSE connection carries live changes, with a keepalive about
-every 20 seconds. These are not repeated HTTP requests. Idle pings use in-memory
-presence and do not query Turso. No recurring requests or SSE run while waiting
-for the access code. Explicit actions/view changes still send requests.
-
-BACKUPS AND UPDATES
-Export events/weights/bags and complete run JSON regularly and download them.
-For a restorable database backup, use Turso's database export/dump tools:
-https://docs.turso.tech/sdk/http/reference (GET /dump)
-Keep the dump outside GitHub along with your operational exports. Protect any
-command or shell history containing the database token. JSON exports support
-analysis; this app has no JSON import/restore UI. Downloading exports alone is
-not an automatic disaster-recovery process.
-
-Automatic application deploys are disabled. Push code to GitHub, then manually
-deploy between production sessions. Changing Blueprint settings can restart the
-service. Keep all four secret environment variables through updates. A changed
-or expired database token must be replaced in Render settings and redeployed.
-Deleting the Render service does not delete Turso data; deleting the Turso
-database does. Never delete real records without verified backups.
-
-VALIDATION
-Local SQLite tests, remote HTTP protocol tests using a local SQLite gateway,
-keyboard checks, and the live application workflow pass. A live Turso deployment
-has not been tested with user credentials, and real browser visual checks remain
-necessary on your station devices. No paid resources have been provisioned.
-
-ACCESS UPDATE
-The app opens without a team code by default. Existing access-code variables
-can be left in Render but do not enable sign-in on their own. Set
-TRAILMIX_REQUIRE_ACCESS_CODE=1 only if you want optional team-code sign-in.
-Set TRAILMIX_SAFETY_PIN to the current Safety PIN before updating to preserve
-that exact value. The PIN is saved in Turso and remains consistent after
-restarts. Without an explicit PIN, one is generated once and saved.
-
-
-Run snapshot storage (HAR performance update)
-Remote run snapshots use a versioned lossless compressed JSON envelope to
-reduce reads/writes. Prior plain JSON is accepted and packs on a later save.
-Use this server.py or a newer compatible build for subsequent deployments;
-older builds cannot decode the packed snapshot format. Local SQLite and all
-JSON/CSV exports remain ordinary JSON/CSV with full audit history. Live API and
-SSE responses omit historical before/after bag copies, retaining activity
-metadata and current bag state. Batch save_seconds logs include database lock
-wait and command processing, excluding HTTP response transmission.
-
-
-Batch phase diagnostics
-Batch saved includes total save_seconds. Batch phases splits lock, read, decode,
-apply, encode, write, commit and publication elapsed seconds; cpu_seconds measures
-CPU consumed by that request thread and excludes waiting and other threads.
-These distinguish CPU work, lock waits and remote call phases. A remote-call
-phase includes network transfer/provider time and any parsing in the adapter;
-it is not the database's SQL execution time alone. Fully duplicate batches now
-use two remote trips and skip the snapshot update.
+LIMITS
+One active backend owns live notifications. Exports and initial loads can still
+be large; production saves do not transfer that history. The Go service requires
+Turso and refuses an insecure/nonpersistent fallback. TRAILMIX_TEST_DB=1 permits
+HTTP only to localhost for development tests and must not be set in production.
+The image's compiled build and local gateway tests passed. The Docker daemon and
+live Render/Turso service were not available for a live container/cloud test.

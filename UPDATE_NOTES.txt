@@ -1,140 +1,52 @@
-Save-path CPU and retry update
+GO REWRITE AND NORMALIZED STORAGE
 
-Server logs confirmed 7.258–14.302 seconds inside Store.commands, including
-roughly 8–9 seconds for one-action saves. A local profile of the captured large
-run found full audit-history deep copies consuming much of the processing time.
+Deploy the entire project, including Dockerfile, go.mod, all .go files, testdata/
+and trailmix.html. Updating server.py alone does not install this version.
+Keep the existing Turso credentials, PIN settings and database. Before first
+migration, finish pending saves and download a complete JSON export. Migration
+is automatic and transactional. Refresh all browsers after deployment.
 
-HTTP state, SSE, device registration and action endpoints now request the live
-projection before making independent response copies. Successful HTTP actions
-publish the privately owned full state without deep-copying all historical bag
-snapshots again. Management actions copy only the pre-action bags and people
-needed for their audit event. Full Store.state and JSON/CSV exports retain the
-original complete audit behavior. Transactions, current-state reads and locks
-are still authoritative; this update introduces no speculative database writes.
+The backend is now compiled Go, using only its standard library. Docker runs
+Go tests, builds a static executable and uses a runtime image with no Python.
+Current entities and run metadata are stored independently from audit history.
+Routine saves read only a revision/request lookup and write only changed
+entities plus new audit records. Browser acknowledgements/SSE send revisioned
+patches instead of complete run snapshots. Full audit history remains in exports.
+The last committed cache stays readable while a remote write is in flight.
 
-A fully duplicate batch now confirms original IDs without re-encoding or
-rewriting the run snapshot, using two database round trips. New and mixed
-batches retain atomic writes and three database round trips.
+Safety PIN and optional login cookie persist. Existing pending request IDs and
+Python request digests are supported, including Unicode/float canonicalization.
+Normal batches are atomic in three remote trips; fully duplicate retries use two
+without rewriting current data. Lost commit confirmations invalidate the cache
+and recover safely by retry. Bad actions/SQL failures roll back all batch rows.
+All existing production, roster, assignment, configuration, delivery and station
+keyboard behavior is retained. Cleared rework still goes directly to Sealing.
 
-Responses and logs include batch phase durations for lock acquisition, database
-read, decode, action application, encode, database write, commit and snapshot
-publication, plus thread CPU seconds. Batch saved still reports total elapsed
-save_seconds. Timings contain no credentials, operator names or bag contents.
+Old snapshot rows and audit rows are retained. Old snapshots become read-only
+after migration to protect against stale Python writers. Do not roll back to
+Python after the new backend has begun saving. Refer to README.md and
+REMOTE_HOSTING.txt for deployment and compatibility details.
 
-Recovered saves must be confirmed before recording more production actions.
-The same per-bag action cannot be enqueued repeatedly while already pending.
-This addresses the captured rejected batch of 16 finish actions for one bag.
+VALIDATION
+- Go compiler 1.27.3; Go tests and vet passed.
+- 133 successful/rejected domain comparisons across 35 actions against Python.
+- 101 backend regressions, including 15 real-HTTP Go migration/recovery tests.
+- Keyboard and incremental patch-merging tests passed.
+- Complete HTTP/DOM production workflow passed with Go and with Python during
+  frontend rollout compatibility checks.
+- Go HTTP integration tests also passed with the race detector enabled.
+- Migration preserves compressed snapshots, PIN/cookie, archived audits, pending
+  request digests, named configurations and request idempotency across restart.
+- Interrupted commits, later-SQL rollback, repeated IDs with changed payload,
+  independent cached reads and revisioned SSE patches are covered.
+- No production database was accessed or deployed from this workspace.
 
-A local three-trial CPU comparison with captured run data measured median
-one-action save CPU from 0.5638 to 0.3408 seconds and cached state-read CPU from
-0.3907 to 0.1269 seconds. These are local CPU measurements, not live cloud
-response-time guarantees. Database transfer and hosting CPU contention still
-need the new phase logs to quantify.
-
-Deploy server.py and trailmix.html, refresh browsers, then use Retry saved
-entries to confirm retained actions. All prior fixes and packed snapshot
-compatibility apply. Old builds cannot read packed snapshots.
-
-Validation: 86 backend tests, keyboard checks and local HTTP/DOM workflow checks
-passed. New regressions check private cache isolation, audit preservation,
-no full audit copying on live paths, two-trip duplicate confirmation and the
-recovered-input guard. No live deployment or cloud stress test was performed.
-
-HAR-based performance update
-
-The supplied 20-request HAR contained 19 successful saves and one canceled
-request at 10.006 seconds. Median successful time waiting for the response was
-8.269 seconds; median response download was 0.160 seconds. Requests already
-batched up to 50 actions. Large current-run snapshots were read and rewritten on
-every save; historical bag snapshots also appeared in every live response.
-
-Remote database run snapshots now use lossless, versioned compression. Existing
-plain JSON reads normally and is packed on the next successful write. No manual
-migration or clearing of inventory is required. Local SQLite stays plain JSON.
-Station API responses and SSE omit historical event before/after bag copies;
-current bags, complete activity entries and event metadata remain available.
-Full before/after snapshots remain in database event history and JSON/CSV exports.
-
-Using the HAR's last successful response as input, database snapshot encoding
-shrunk from 8,490,607 to 1,088,802 bytes, and live JSON response size fell from
-8,542,844 to 2,721,457 bytes (before HTTP compression). Encoding took about 71 ms
-in the local sample and decoding returned the exact original state. This is a
-payload-size comparison, not a measured live-hosting latency improvement.
-
-Deploy server.py and trailmix.html, then refresh station browsers. The 60-second
-POST timeout, duplicate-safe saved-entry retries, disconnect cleanup, HEAD
-support and batch save-duration logging are included. The first save still has
-to read the old large snapshot; later saves use the packed format.
-
-Compatibility: old server builds cannot read the new packed remote snapshots.
-Keep this server.py or a newer compatible version when redeploying. JSON exports
-remain ordinary complete JSON. Audit rows are still append-only.
-
-Validation: 86 backend tests plus keyboard and local HTTP/DOM workflow checks
-passed, including large lossless snapshots, legacy reads/upgrade/restart,
-archives, live-response projection, complete audit exports and lost-commit
-retries. Live Render/Turso latency has not been measured with this version.
-
-Additional stress-log fixes
-
-The supplied log revealed a disconnect during the initial live-update (SSE)
-handshake. Disconnect handling now covers stream headers, the retry preamble,
-the initial state and later updates. HEAD / and HEAD /index.html return page
-headers with no body, supporting hosting probes without the previous 501.
-
-Successful /api/actions batches now log actions=N and save_seconds=N.NNN.
-This includes time waiting for the database lock and command processing, but
-excludes sending the HTTP response. Response log intervals alone do not measure
-request latency; use these timings during the next stress test.
-
-Deploy server.py and trailmix.html, refresh browsers, and retry retained entries
-using their original IDs. All earlier disconnect and timeout fixes are included.
-
-Stress-test disconnect fix
-
-Deploy server.py and trailmix.html, then refresh station browsers. Retained
-pending entries should use Retry saved entries, preserving the original action
-IDs. Do not repeat physical actions because confirmation was lost.
-
-HTTP disconnects while sending headers or body now close the connection without
-a second response or a misleading save-failed traceback. A batch may have
-committed before its response was lost. Unexpected server errors now report an
-unconfirmed save and allow retrying the same request IDs instead of claiming
-that nothing committed. POST requests wait up to 60 seconds for confirmation
-(previously 10); read requests retain their 10-second timeout. This accommodates
-slow saves without changing transaction speed or batching limits.
-
-Regression checks simulate disconnects before headers and during the response,
-verify committed batches retry exactly once, and exercise unexpected failures
-after commit. All 86 backend tests, keyboard checks and the local HTTP/DOM
-production workflow passed. Live hosting stress latency was not measured here.
-
-Direct rework to Sealing, saved configurations and station-page assignment
-
-Let pending saves finish. Deploy server.py, turso_db.py and trailmix.html
-together, then refresh all station browsers. Keep existing database and Safety
-PIN settings. No paid service or extra database setup is required.
-
-Cleared rework now goes directly to Sealing. Only Labeling → Filling and
-Filling → First inspection have filling-station choices. Downstream legs are
-shared routes without filling-origin labels. Bag history still retains origin.
-The startup upgrade consolidates old downstream assignments. Cleared rework
-already in transit is delivered to Sealing under the updated plan. Cleared
-rework already returned to Inspection becomes ready for Sealing pickup.
-
-Settings → Saved configurations saves named setups (Coordinator / Safety role).
-The snapshot includes people, station / delivery assignments, station definitions
-and device assignments. At End this run → Setup for next run, choose Keep
-current setup or a saved setup. The next run starts with empty inventory, queues
-and mixing batch IDs; old production records remain archived. Configuration
-snapshots do not contain Safety PINs or session credentials.
-
-A collapsed Coordinator assignment panel is available on actual station pages,
-including station mode. Choose a person and optionally replace the existing
-assignment or also assign this device. Delivery pages include a leg selector.
-Assignments are logged and unfinished weight entry is preserved.
-
-Validation: 86 backend tests plus keyboard and local HTTP workflows passed,
-including direct rework, shared mixed-origin packages, named configuration
-reloads, new-run resets, coordinator assignments, saved remote setups and retries.
-Live cloud deployment and full-browser visual rendering were not tested here.
+LOCAL LARGE-RUN COMPARISON (not cloud latency)
+Fixture: captured run with 837 bags and 3,424 prior events. Go ran with
+GOMAXPROCS=1 and GOMEMLIMIT=128MiB against the same local SQLite HTTP gateway.
+One-bag Python save: 1,197,190 database request bytes; 3,064,219 response bytes;
+0.294 s elapsed in the comparison sample.
+One-bag Go save: 5,028 database request bytes; 1,860 response bytes;
+0.054 s median elapsed across five local samples.
+Initial loads/exports still transfer history as needed. Live Render/Turso latency
+must be measured after deployment; local numbers are not a live performance claim.

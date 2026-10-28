@@ -88,6 +88,8 @@ class Store:
                 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT,'Event history is append-only'); END;
             ''')
             db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT value FROM meta WHERE key='tm_storage_version'").fetchone():
+                raise RuntimeError('This database has been migrated to the Go backend. Start the Go service; Python cannot write it.')
             saved_pin = db.execute("SELECT value FROM meta WHERE key='safety_pin'").fetchone()
             configured_pin = str(safety_pin).strip() if safety_pin else None
             self.pin_created = not saved_pin and not configured_pin

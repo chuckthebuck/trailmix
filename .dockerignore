@@ -1,0 +1,11 @@
+.git
+__pycache__
+*.pyc
+*.sqlite3
+*.sqlite3-*
+*.har
+data
+toolchain
+node_modules
+.venv
+fixed

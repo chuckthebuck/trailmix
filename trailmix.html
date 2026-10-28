@@ -406,7 +406,40 @@ function stationKeyboard(event){
 if(window.addEventListener)window.addEventListener('keydown',stationKeyboard,true);
 else if(document.addEventListener)document.addEventListener('keydown',stationKeyboard,true);
 
-async function api(path,body){const res=await fetch(path,{signal:AbortSignal.timeout(body?60000:10000),method:body?'POST':'GET',headers:body?{'Content-Type':'application/json','X-TrailMix':'1'}:{},body:body?JSON.stringify(body):undefined});let data;try{data=await res.json()}catch(e){throw Error('Server response could not be read. Retry the same save.')}if(!res.ok){const e=Error(data.error||'Request failed');e.status=res.status;e.retryable=!!data.retryable;throw e}return data}
+// Confirmed server data is separate from the local preview/outbox. Both HTTP
+// acknowledgements and SSE patches merge into this revisioned snapshot.
+let confirmedServerState=null;
+function acceptServerState(next){
+ if(!confirmedServerState||next.runId!==confirmedServerState.runId&&(next.started||0)>=(confirmedServerState.started||0)||next.runId===confirmedServerState.runId&&next.revision>=confirmedServerState.revision)confirmedServerState=JSON.parse(JSON.stringify(next));
+ return JSON.parse(JSON.stringify(confirmedServerState));
+}
+function mergeServerPatch(patch){
+ if(patch.reset){return acceptServerState(patch.reset)}
+ const base=confirmedServerState;
+ if(!base||base.runId!==patch.runId||base.revision<patch.baseRevision)throw Error('A live update was missed. Reload the confirmed state.');
+ if(patch.revision<base.revision)return JSON.parse(JSON.stringify(base));
+ const next={...base,...patch.core};
+ for(const [kind,change] of Object.entries(patch.entities||{})){
+  const removed=new Set((change.remove||[]).map(String)),upsert=new Map((change.upsert||[]).map(value=>[String(value.id),value]));
+  next[kind]=(base[kind]||[]).filter(value=>!removed.has(String(value.id))).map(value=>{const key=String(value.id);if(upsert.has(key)){const result=upsert.get(key);upsert.delete(key);return result}return value});
+  next[kind].push(...upsert.values());
+ }
+ const known=new Set((base.events||[]).map(event=>event.id));next.events=[...(base.events||[]),...(patch.eventsAppend||[]).filter(event=>!known.has(event.id))];
+ confirmedServerState=next;
+ return JSON.parse(JSON.stringify(next));
+}
+async function confirmedPatch(patch){
+ try{return mergeServerPatch(patch)}catch(e){const snapshot=await api('/api/state?deviceId='+encodeURIComponent(deviceId));if(snapshot.runId===patch.runId&&snapshot.revision>=patch.revision||patch.reset)return snapshot;throw e}
+}
+async function api(path,body){
+ const res=await fetch(path,{signal:AbortSignal.timeout(body?60000:10000),method:body?'POST':'GET',headers:{'X-TrailMix-Sync':'delta-v1',...(body?{'Content-Type':'application/json','X-TrailMix':'1'}:{})},body:body?JSON.stringify(body):undefined});
+ let data;try{data=await res.json()}catch(e){throw Error('Server response could not be read. Retry the same save.')}
+ if(!res.ok){const e=Error(data.error||'Request failed');e.status=res.status;e.retryable=!!data.retryable;throw e}
+ if(data.delta){data.state=await confirmedPatch(data.delta);if(path.startsWith('/api/device/hello'))return data.state;}
+ else if(data.state)data.state=acceptServerState(data.state);
+ else if(data.runId&&Array.isArray(data.events))data=acceptServerState(data);
+ return data;
+}
 function loginView(message=''){stopLiveUpdates();if($('reconnectButton'))$('reconnectButton').hidden=true;awaitingLogin=true;deviceRegistered=false;connected=false;applyStationShell();$('mode').textContent='NOT CONNECTED';$('nav').innerHTML='';$('content').innerHTML=`<div class="panel" style="max-width:500px;margin:70px auto"><div class="eyebrow">TrailMix / shared stations</div><h1 class="section">Connect to production.</h1><p class="muted">Enter the team access code shown on the server computer. Every station uses this same web address.</p><label>Team access code<input type="password" id="accessCode" onkeydown="if(event.key==='Enter')login()" autocomplete="current-password"></label><div class="section">${button('Connect','login()')}</div><p class="danger section" id="loginError">${esc(message)}</p></div>`;setupStationKeyboard()}
 async function login(){try{await api('/api/login',{code:$('accessCode').value});awaitingLogin=false;await refresh(true)}catch(e){$('loginError').textContent=e.message}}
 
@@ -434,8 +467,9 @@ function applyLiveState(next,force=false){
 function stopLiveUpdates(){if(liveUpdates){liveUpdates.close();liveUpdates=null}queuedLiveState=null}
 function startLiveUpdates(){
  if(liveUpdates||awaitingLogin||!connected||typeof EventSource==='undefined')return;
- liveUpdates=new EventSource('/api/stream?deviceId='+encodeURIComponent(deviceId));
- liveUpdates.addEventListener('state',event=>{try{applyLiveState(JSON.parse(event.data))}catch(e){toast('Could not apply an update. Use Reconnect.')}});
+ liveUpdates=new EventSource('/api/stream?deviceId='+encodeURIComponent(deviceId)+'&sync=delta-v1');
+ liveUpdates.addEventListener('state',event=>{try{applyLiveState(acceptServerState(JSON.parse(event.data)))}catch(e){toast('Could not apply an update. Use Reconnect.')}});
+ liveUpdates.addEventListener('patch',async event=>{try{applyLiveState(await confirmedPatch(JSON.parse(event.data)))}catch(e){toast('Could not apply an update. Use Reconnect.')}});
  liveUpdates.addEventListener('ping',event=>{try{const ping=JSON.parse(event.data);lastSync=Date.now();connected=true;if($('reconnectButton'))$('reconnectButton').hidden=true;$('mode').textContent='CONNECTED · LIVE';for(const live of ping.devices||[]){const d=(state.devices||[]).find(d=>d.id===live.id);if(d)Object.assign(d,{lastSeen:live.lastSeen,online:live.online,observedMode:live.observedMode,observedOperator:live.observedOperator})}if(page==='Devices'&&!editingStationForm())render()}catch(e){}});
  liveUpdates.onerror=()=>{connected=false;if($('reconnectButton'))$('reconnectButton').hidden=false;$('mode').textContent='DISCONNECTED · Reconnect';setupStationKeyboard();if(!editingStationForm()&&(projectorMode||page==='Delivery dashboard'))render()};
 }

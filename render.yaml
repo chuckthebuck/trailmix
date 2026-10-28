@@ -1,15 +1,13 @@
-# Free Render web service + external free Turso libSQL database.
-# Set up Turso first; no local database or paid persistent disk is used.
+# Compiled Go service with existing persistent Turso storage.
 services:
   - type: web
     name: trailmix-production-desk
-    runtime: python
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     plan: free
     region: oregon
     numInstances: 1
-    buildCommand: python -m py_compile server.py turso_db.py
-    startCommand: python -u server.py
-    healthCheckPath: /
+    healthCheckPath: /healthz
     autoDeployTrigger: "off"
     envVars:
       - key: TURSO_DATABASE_URL
@@ -22,3 +20,7 @@ services:
         value: "0"
       - key: TRAILMIX_SAFETY_PIN
         sync: false
+      - key: GOMEMLIMIT
+        value: "384MiB"
+      - key: GOMAXPROCS
+        value: "1"
