@@ -126,7 +126,7 @@ func (c actionContext) shipment(source string, station any, bs A, movement M, le
 	return d
 }
 func (c actionContext) receipt(bs A, movement any) A {
-	bagIDs := ids(bs)
+	bagIDs := idSet(ids(bs))
 	changes := A{}
 	for _, v := range arr(c.s["deliveries"]) {
 		d := obj(v)
@@ -135,7 +135,7 @@ func (c actionContext) receipt(bs A, movement any) A {
 		}
 		received, remaining := A{}, A{}
 		for _, id := range arr(d["remainingBagIds"]) {
-			if has(bagIDs, id) {
+			if bagIDs[text(id)] {
 				received = append(received, id)
 			} else {
 				remaining = append(remaining, id)
@@ -230,8 +230,9 @@ func (c actionContext) run(action string) M {
 		}
 		source := legs[text(d["source"])][3]
 		bs := A{}
+		bags := entityIndex(s, "bags")
 		for _, id := range arr(d["remainingBagIds"]) {
-			b := find(s, "bags", id)
+			b := bags[text(id)]
 			require(b != nil && text(b["status"]) == source, "Package contents changed. Review this delivery before proceeding.")
 			bs = append(bs, b)
 		}

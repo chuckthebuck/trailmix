@@ -131,8 +131,12 @@ func (e *engine) reload(ctx context.Context) error {
 }
 func mapFromIDs(s M, bagIDs any) A {
 	selected := A{}
+	if len(arr(bagIDs)) == 0 {
+		return selected
+	}
+	wanted := idSet(bagIDs)
 	for _, v := range arr(s["bags"]) {
-		if has(bagIDs, obj(v)["id"]) {
+		if wanted[text(obj(v)["id"])] {
 			selected = append(selected, clone(v))
 		}
 	}

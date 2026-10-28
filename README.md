@@ -43,6 +43,10 @@ The new startup log begins `TrailMix Go is running`. HTTP responses also include
   New state is published only after a confirmed commit.
 - Full before/after bag records remain in audit storage and JSON/CSV exports.
   Normal screen updates contain event summaries, not audit bag snapshots.
+- Bulk movements use indexed bag selection and receipt matching. Unchanged
+  records are compared directly rather than repeatedly encoded as JSON.
+  Concurrent-device tests cover 24 devices saving/retrying together and
+  competing pickups/receipts of the same bags.
 
 Production behavior is retained: 2.00–2.25 oz net inclusive, out-of-spec rework
 rejected, cleared rework directly to Sealing, per-person delivery assignments,
@@ -61,6 +65,9 @@ started saving actions.** Use this Go backend or a compatible later version.
 
 Keep one backend instance. Database revision checks reject stale cached writers,
 but live notifications are intentionally owned by one service instance.
+Saves are serialized to preserve inventory and exact package contents. A burst
+from many devices still queues behind earlier transactions; cached reads remain
+available. Local concurrency tests verify correctness, not live latency limits.
 
 ## Development
 

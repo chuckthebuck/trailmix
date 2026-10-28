@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from turso_db import encode, decode
@@ -16,6 +17,8 @@ class Gateway(BaseHTTPRequestHandler):
             self.send_error(401)
             return
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if self.server.delay_seconds:
+            time.sleep(self.server.delay_seconds)
         self.server.pipelines.append(body)
         self.server.request_count += 1
         baton = body.get('baton') or str(uuid.uuid4())
@@ -56,6 +59,6 @@ class Gateway(BaseHTTPRequestHandler):
 def start_gateway(path):
     server=ThreadingHTTPServer(('127.0.0.1',0),Gateway)
     server.path=str(path);server.connections={};server.pipelines=[];server.statements=[];server.request_count=0
-    server.fail_prefix=None;server.drop_commit=False;server.gate=None
+    server.fail_prefix=None;server.drop_commit=False;server.gate=None;server.delay_seconds=0
     threading.Thread(target=server.serve_forever,daemon=True).start()
     return server

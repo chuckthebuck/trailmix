@@ -55,6 +55,7 @@ class GoBackendTests(unittest.TestCase):
             self.proc.terminate();self.proc.wait(timeout=15)
             if self.reader:self.reader.join(timeout=2)
             self.proc.stdout.close();self.proc=None
+            self.assertFalse(any('WARNING: DATA RACE' in line for line in self.logs), ''.join(self.logs))
 
     def request(self,method,path,body=None,delta=False):
         conn=http.client.HTTPConnection('127.0.0.1',self.port,timeout=30)
@@ -125,6 +126,71 @@ class GoBackendTests(unittest.TestCase):
         status,data=self.batch([request]);self.assertEqual(status,200,data);self.assertTrue(data['results'][0]['duplicate'])
         exported=self.request('GET','/api/export?kind=json')[1]
         self.assertEqual(exported['labels'],4);self.assertEqual(len(exported['events']),1)
+
+    def test_twenty_four_devices_fill_and_retry_without_lost_updates(self):
+        self.start()
+        self.act('label',qty=240)
+        state=self.act('labelPickup',qty=240,station=1)
+        self.act('receiveLabels',movement=state['moves'][0]['id'])
+        self.act('assignBatch',station=1,batch='STRESS')
+        first=self.req('fill',station=1,mixBatch='STRESS')
+        devices=[[dict(first,requestId=str(uuid.uuid4()),deviceId='dev-stress-'+str(i)) for _ in range(10)] for i in range(24)]
+        self.gateway.delay_seconds=.01
+        ready=threading.Barrier(len(devices))
+        def save(commands):
+            ready.wait(timeout=15)
+            return self.batch(commands)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=24) as pool:
+            replies=list(pool.map(save,devices))
+            for status,data in replies:self.assertEqual(status,200,data)
+            retries=list(pool.map(save,devices))
+        for status,data in retries:
+            self.assertEqual(status,200,data)
+            self.assertTrue(all(item['duplicate'] for item in data['results']))
+        state=self.request('GET','/api/state')[1]
+        self.assertEqual(len(state['bags']),240)
+        self.assertEqual(len({b['id'] for b in state['bags']}),240)
+        self.assertEqual(state['stations'][0]['empty'],0)
+        self.assertEqual(state['revision'],244)
+        self.assertEqual(len(state['events']),244)
+        self.stop();state=self.start()
+        self.assertEqual(len(state['bags']),240)
+        self.assertEqual(state['revision'],244)
+
+    def test_competing_bulk_pickups_and_receipts_preserve_exact_bags(self):
+        self.start()
+        self.act('label',qty=50)
+        state=self.act('labelPickup',qty=50,station=1)
+        self.act('receiveLabels',movement=state['moves'][0]['id'])
+        self.act('assignBatch',station=1,batch='STRESS')
+        first=self.req('fill',station=1,mixBatch='STRESS')
+        self.assertEqual(self.batch([dict(first,requestId=str(uuid.uuid4())) for _ in range(50)])[0],200)
+        state=self.request('GET','/api/state')[1];bag_ids=[b['id'] for b in state['bags']]
+        self.gateway.delay_seconds=.01
+        def compete(action,source):
+            first=self.req(action,source=source,qty=50,expectedBagIds=bag_ids)
+            commands=[dict(first,requestId=str(uuid.uuid4())) for _ in range(12)]
+            ready=threading.Barrier(12)
+            def save(command):ready.wait(timeout=15);return self.batch([command])
+            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:replies=list(pool.map(save,commands))
+            self.assertEqual(sum(status==200 for status,_ in replies),1)
+            self.assertEqual(sum(status==409 for status,_ in replies),11)
+            winner=commands[next(i for i,(status,_) in enumerate(replies) if status==200)]
+            status,data=self.batch([winner]);self.assertEqual(status,200,data)
+            self.assertTrue(data['results'][0]['duplicate'])
+        compete('move','filled');compete('receive','inspectionTransit')
+        state=self.request('GET','/api/state')[1]
+        self.assertTrue(all(b['status']=='inspection' for b in state['bags']))
+        packages=[d for d in state['deliveries'] if d['source']=='filled']
+        self.assertEqual(len(packages),1)
+        self.assertEqual(packages[0]['status'],'delivered')
+        self.assertEqual(packages[0]['remainingBagIds'],[])
+        exported=self.request('GET','/api/export?kind=json')[1]
+        movements=[e for e in exported['events'] if e['action'] in ('move','receive')]
+        self.assertEqual(len(movements),2)
+        for event in movements:
+            self.assertEqual([b['id'] for b in event['before']],bag_ids)
+            self.assertEqual([b['id'] for b in event['after']],bag_ids)
 
     def test_partial_sql_failure_rolls_back_audit_entities_requests_and_header(self):
         self.start();request=self.req('label',qty=4);self.gateway.fail_prefix='UPDATE tm_runs'

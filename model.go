@@ -35,8 +35,15 @@ func text(v any) string {
 	if v == nil {
 		return ""
 	}
-	if s, ok := v.(string); ok {
+	switch s := v.(type) {
+	case string:
 		return s
+	case json.Number:
+		return string(s)
+	case int:
+		return strconv.Itoa(s)
+	case int64:
+		return strconv.FormatInt(s, 10)
 	}
 	return fmt.Sprint(v)
 }
@@ -111,8 +118,63 @@ func clone(v any) any {
 		return v
 	}
 }
-func equal(a, b any) bool { return bytes.Equal(encode(a), encode(b)) }
-func same(a, b any) bool  { return text(a) == text(b) }
+
+// Compare JSON values without serializing every unchanged bag twice for SQL
+// and again for sync. Keep the exact encoded semantics for numeric spellings,
+// null versus empty containers and mixed Go/decoded JSON number types.
+func equal(a, b any) bool {
+	switch x := a.(type) {
+	case map[string]any:
+		if y, ok := b.(map[string]any); ok && x != nil && y != nil {
+			if len(x) != len(y) {
+				return false
+			}
+			for k, v := range x {
+				other, exists := y[k]
+				if !exists || !equal(v, other) {
+					return false
+				}
+			}
+			return true
+		}
+	case []any:
+		if y, ok := b.([]any); ok && x != nil && y != nil {
+			if len(x) != len(y) {
+				return false
+			}
+			for i, v := range x {
+				if !equal(v, y[i]) {
+					return false
+				}
+			}
+			return true
+		}
+	case string:
+		y, ok := b.(string)
+		return ok && x == y
+	case bool:
+		y, ok := b.(bool)
+		return ok && x == y
+	case json.Number:
+		if y, ok := b.(json.Number); ok {
+			return x == y
+		}
+	case int:
+		if y, ok := b.(int); ok {
+			return x == y
+		}
+	case int64:
+		if y, ok := b.(int64); ok {
+			return x == y
+		}
+	case float64:
+		if y, ok := b.(float64); ok {
+			return math.Float64bits(x) == math.Float64bits(y)
+		}
+	}
+	return bytes.Equal(encode(a), encode(b))
+}
+func same(a, b any) bool { return text(a) == text(b) }
 func has(a any, v any) bool {
 	for _, x := range arr(a) {
 		if same(x, v) {
@@ -120,6 +182,23 @@ func has(a any, v any) bool {
 		}
 	}
 	return false
+}
+func idSet(values any) map[string]bool {
+	set := make(map[string]bool, len(arr(values)))
+	for _, id := range arr(values) {
+		set[text(id)] = true
+	}
+	return set
+}
+func entityIndex(s M, kind string) map[string]M {
+	index := make(map[string]M, len(arr(s[kind])))
+	for _, v := range arr(s[kind]) {
+		m := obj(v)
+		if _, exists := index[text(m["id"])]; !exists {
+			index[text(m["id"])] = m
+		}
+	}
+	return index
 }
 func find(s M, kind string, id any) M {
 	for _, v := range arr(s[kind]) {

@@ -1,3 +1,42 @@
+BULK MOVEMENT CPU FIX AND MULTI-DEVICE STRESS TESTING
+
+This update installs over the existing Go release without another schema change.
+Deploy the complete project and refresh station browsers as usual.
+
+The supplied HAR contains 277 successful saves. Large pickups/receipts took
+4-6.5 seconds, primarily in action processing. Bag audit selection repeatedly
+scanned all selected IDs for each bag; receipt matching and routed delivery also
+repeated linear searches. These now use temporary indexes with the same exact
+bag selection, ordering and audit contents. Unchanged entity comparisons no
+longer serialize every bag repeatedly to JSON. Request digests are unchanged.
+
+Local CPU benchmark, 2,000 bags, three iterations per sample:
+  Movement qty    Previous CPU path    Updated CPU path
+  16              46.6 ms              5.9 ms
+  600             360.7 ms             13.8 ms
+  2,000           898.4 ms             31.8 ms
+The 600-bag allocation count fell from about 4.7 million to 61,000 per operation.
+These measurements include cloning, action validation, before/after audit
+snapshots, audit JSON, SQL entity comparison and browser patch construction.
+
+Real-HTTP local comparison using 1,189 captured bag records, GOMAXPROCS=1,
+128MiB Go memory limit, and 20ms added latency per database HTTP call:
+  600-bag pickup: 365 ms -> 129 ms
+  600-bag receipt: 408 ms -> 119 ms
+  24 simultaneous one-action saves, last acknowledgement: 2.44 s -> 1.77 s
+Database request bytes remained identical; full audit records are retained.
+These are local SQLite gateway measurements, not Render/Turso latency promises.
+Writes remain serialized. Additional devices can still queue behind a save;
+this update reduces the CPU work inside that serialized path.
+
+New regressions submit 24 simultaneous devices with ten fills each, retry all
+240 actions, and restart to verify unique bags, inventory, revisions and audit.
+Twelve competing pickups and then twelve competing receipts select the same
+bags: exactly one pickup and one receipt commit, all competitors are rejected,
+and retries of the winners remain idempotent. Cached-read/failure/recovery
+regressions remain in place. Full checks: 103 backend tests, 133 Python domain
+comparisons, Go tests/vet, keyboard, patch merging and both workflow harnesses.
+
 GO REWRITE AND NORMALIZED STORAGE
 
 Deploy the entire project, including Dockerfile, go.mod, all .go files, testdata/
@@ -30,7 +69,7 @@ REMOTE_HOSTING.txt for deployment and compatibility details.
 VALIDATION
 - Go compiler 1.27.3; Go tests and vet passed.
 - 133 successful/rejected domain comparisons across 35 actions against Python.
-- 101 backend regressions, including 15 real-HTTP Go migration/recovery tests.
+- 103 backend regressions, including 17 real-HTTP Go migration/recovery tests.
 - Keyboard and incremental patch-merging tests passed.
 - Complete HTTP/DOM production workflow passed with Go and with Python during
   frontend rollout compatibility checks.
