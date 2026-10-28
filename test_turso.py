@@ -150,7 +150,7 @@ class TursoTests(unittest.TestCase):
         self.assertEqual(self.gateway.request_count-start,3)
         start=self.gateway.request_count
         result=self.store.commands(batch)
-        self.assertEqual(self.gateway.request_count-start,3)
+        self.assertEqual(self.gateway.request_count-start,2)
         self.assertEqual(len(result['state']['bags']),50)
         self.assertTrue(all(r['duplicate'] for r in result['results']))
 
@@ -267,3 +267,41 @@ class TursoTests(unittest.TestCase):
         exported = json.loads(self.store.export('json')[1])
         self.assertEqual(exported['events'][:-1],state['events'])
         self.assertEqual(exported['events'][-2]['after'][0]['id'],state['bags'][0]['id'])
+
+    def test_live_copies_preserve_private_cache_and_complete_audit(self):
+        self.stocked(1)
+        request = self.req('fill',station=1,mixBatch='MIX-001')
+        request['queued'] = True
+        real_copy = server.copy.deepcopy
+        def guarded_copy(value, *args, **kwargs):
+            if isinstance(value,dict) and 'events' in value:
+                self.assertFalse(any('before' in event or 'after' in event for event in value['events']),
+                                 'Live request deep-copied the full historical audit')
+            return real_copy(value, *args, **kwargs)
+        with patch.object(server.copy,'deepcopy',side_effect=guarded_copy):
+            result = self.store.commands([request],live=True)
+            live = self.store.state(live=True)
+            self.store.device_hello(dict(deviceId='dev-copy-test'),live=True)
+            current = self.store.state(live=True)
+            note = dict(action='note',args={'note':'Copy isolation check'},operator='Tester',requestId=str(uuid.uuid4()),runId=current['runId'],revision=current['revision'])
+            self.store.command(note,live=True)
+        self.assertNotIn('after',result['results'][0]['event'])
+        original = self.store.state()
+        result['state']['bags'][0]['status'] = 'modified response'
+        live['events'][0]['data']['qty'] = 999
+        result['results'][0]['event']['changes']['qty'] = 999
+        self.assertEqual(self.store.state()['bags'],original['bags'])
+        self.assertEqual(self.store.state()['events'],original['events'])
+        self.assertIn('after',original['events'][-3])
+        self.assertEqual(self.reopen().state()['events'],original['events'])
+
+    def test_duplicate_live_batch_skips_snapshot_rewrite(self):
+        request = self.req('label',qty=3)
+        request['queued'] = True
+        self.store.commands([request],live=True)
+        start = self.gateway.request_count
+        with patch.object(self.store,'encode_state',side_effect=AssertionError('Duplicate rewrote snapshot')):
+            result = self.store.commands([request],live=True)
+        self.assertTrue(result['results'][0]['duplicate'])
+        self.assertEqual(self.gateway.request_count-start,2)
+        self.assertEqual(result['timings']['cpu_seconds']>=0,True)

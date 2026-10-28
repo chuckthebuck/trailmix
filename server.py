@@ -162,20 +162,30 @@ class Store:
             row = db.execute("SELECT state FROM runs WHERE id=(SELECT value FROM meta WHERE key='current')").fetchone()
         return Store.decode_state(row)
 
-    def state(self, run=None):
-        # One server owns writes and SSE. Share its committed snapshot across
-        # screens rather than querying Turso separately for every subscriber.
+    def state(self, run=None, *, live=False):
+        # Project before copying: screens do not need historical bag snapshots.
         with self.database_lock:
-            if self.turso_url and not run and self.cached_current is not None:
-                state = copy.deepcopy(self.cached_current)
+            cached = self.turso_url and not run and self.cached_current is not None
+            if cached:
+                source = self.cached_current
             else:
                 with self.connect() as db:
-                    state = self.load(db, run)
+                    source = self.load(db, run)
                 if self.turso_url and not run:
-                    self.cached_current = copy.deepcopy(state)
+                    self.cached_current = source
+            state = (copy.deepcopy(live_state(source)) if live else
+                     copy.deepcopy(source) if self.turso_url and not run else source)
         if not run:
             self.attach_presence(state)
         return state
+
+    def publish_snapshot(self, state, live):
+        # HTTP callers receive an independent projected copy. The full decoded
+        # state can become the private cache without cloning the audit again.
+        self.cached_current = state if live else copy.deepcopy(state)
+        response = copy.deepcopy(live_state(state)) if live else state
+        self.attach_presence(response)
+        return response
 
     def attach_presence(self, state):
         with self.presence_lock:
@@ -186,19 +196,19 @@ class Store:
                 device['observedMode'] = live.get('mode', '')
                 device['observedOperator'] = live.get('operator', '')
 
-    def device_hello(self, req):
+    def device_hello(self, req, *, live=False):
         did = req.get('deviceId')
         if not isinstance(did, str) or not 8 <= len(did) <= 100 or not all(c.isalnum() or c in '-_' for c in did):
             raise Problem('Invalid device identifier.')
-        state = self.state()
+        state = self.state(live=live)
         if not any(d['id'] == did for d in state['devices']):
             self.command(dict(action='deviceRegister', args={'device':did}, operator='Device setup',
-                              deviceId=did, requestId=str(uuid.uuid4()), runId=state['runId'], revision=state['revision']))
+                              deviceId=did, requestId=str(uuid.uuid4()), runId=state['runId'], revision=state['revision']), live=live)
         with self.presence_lock:
             live = self.presence.setdefault(did, {})
             live.update(seen=NOW(), mode=str(req.get('mode',''))[:100], operator=str(req.get('operator',''))[:100])
         self.notify_change()
-        return self.state()
+        return self.state(live=live)
 
     def notify_change(self):
         with self.changed:
@@ -217,13 +227,13 @@ class Store:
         return [dict(id=s['runId'], name=s['batch'], started=s['started'], archived=bool(a),
                      bags=len(s['bags']), events=len(s['events'])) for raw, a in rows for s in [self.decode_state((raw,))]]
 
-    def command(self, req):
+    def command(self, req, *, live=False):
         # Keep commit, snapshot publication, and change notification in order.
         with self.database_lock:
-            response = self._command(req)
+            response = self._command(req, live=live)
             return response
 
-    def _command(self, req):
+    def _command(self, req, *, live=False):
         if not isinstance(req, dict):
             raise Problem('Invalid command.')
         operator = str(req.get('operator', '')).strip()
@@ -247,8 +257,7 @@ class Store:
                     raise Problem('Request ID already used for a different action.')
                 response = dict(state=s, duplicate=True)
                 db.commit()
-                self.cached_current = copy.deepcopy(s)
-                self.attach_presence(response['state'])
+                response['state'] = self.publish_snapshot(s, live)
                 self.notify_change()  # The original commit may have lost its response.
                 return response
             if req.get('runId') != s['runId']:
@@ -265,7 +274,7 @@ class Store:
                 intervening = [e for e in s['events'] if e.get('revision', 0) > revision]
                 if any(e.get('action') not in STAFF_ACTIONS for e in intervening):
                     raise Problem('Another station updated the run. The latest data has been loaded; review and retry.')
-            old = copy.deepcopy(s)
+            old = dict(runId=s['runId'], bags=copy.deepcopy(s['bags']), people=copy.deepcopy(s['people']))
             when = NOW()
             result = self.apply(s, action, args, operator, when)
             new = None
@@ -330,8 +339,9 @@ class Store:
                 writes.append(("INSERT INTO meta(key,value) VALUES ('class_roster_v1','done') ON CONFLICT(key) DO NOTHING",()))
             self.execute_group(db, writes)
             response = dict(state=s, event=event)
-        self.cached_current = copy.deepcopy(response['state'])
-        self.attach_presence(response['state'])
+        response['state'] = self.publish_snapshot(response['state'], live)
+        if live:
+            response['event'] = copy.deepcopy(live_event(event))
         self.notify_change()
         return response
 
@@ -358,12 +368,14 @@ class Store:
         return self.command(dict(action='rosterImport',args={},operator='Roster setup',
             requestId='class-roster-v1',runId=state['runId'],revision=state['revision']))
 
-    def commands(self, requests):
+    def commands(self, requests, *, live=False):
         """Commit up to fifty queued station actions in three remote round trips.
 
         Each action keeps its own ID and audit event. A failure rolls back the
         entire batch; a lost response can be retried without repeating actions.
         """
+        started, cpu_started = time.monotonic(), time.thread_time()
+        timings = {}
         if not isinstance(requests, list) or not 1 <= len(requests) <= 50:
             raise Problem('Send between 1 and 50 station actions.')
         ids = []
@@ -379,13 +391,19 @@ class Store:
             ids.append(rid)
             digests.append(hashlib.sha256(json.dumps(req, sort_keys=True).encode()).hexdigest())
         with self.database_lock:
+            timings['lock_seconds'] = time.monotonic()-started
             with self.connect() as db:
+                phase = time.monotonic()
                 _, prior_rows, state_rows = self.execute_group(db, [
                     ('BEGIN IMMEDIATE', ()),
                     ('SELECT id,digest FROM requests WHERE id IN ('+','.join('?' for _ in ids)+')', tuple(ids)),
                     ("SELECT state FROM runs WHERE id=(SELECT value FROM meta WHERE key='current')", ())])
+                timings['read_seconds'] = time.monotonic()-phase
+                phase = time.monotonic()
                 prior = dict(prior_rows.fetchall())
                 state = self.decode_state(state_rows.fetchone())
+                timings['decode_seconds'] = time.monotonic()-phase
+                phase = time.monotonic()
                 results, writes, remap = [], [], {}
                 event_by_request = {e.get('requestId'):e for e in state['events'] if e.get('requestId')}
                 for event in state['events']:
@@ -450,12 +468,25 @@ class Store:
                         remap['pending-'+rid] = (event['bags'][0] if action=='fill' else event['changes']['movementId'] if action=='labelPickup' else event['changes']['deliveryIds'][0])
                         if action=='routePickup' and event['changes'].get('movementId') is not None:
                             remap['pending-move-'+rid] = event['changes']['movementId']
-                writes.append(('UPDATE runs SET state=? WHERE id=?',(self.encode_state(state),state['runId'])))
-                self.execute_group(db,writes)
-            self.cached_current = copy.deepcopy(state)
-            self.attach_presence(state)
+                timings['apply_seconds'] = time.monotonic()-phase
+                phase = time.monotonic()
+                if writes:
+                    writes.append(('UPDATE runs SET state=? WHERE id=?',(self.encode_state(state),state['runId'])))
+                timings['encode_seconds'] = time.monotonic()-phase
+                phase = time.monotonic()
+                if writes:
+                    self.execute_group(db,writes)
+                timings['write_seconds'] = time.monotonic()-phase
+                phase = time.monotonic()
+            timings['commit_seconds'] = time.monotonic()-phase
+            phase = time.monotonic()
+            state = self.publish_snapshot(state, live)
+            if live:
+                results = [dict(item, event=copy.deepcopy(live_event(item.get('event')))) for item in results]
             self.notify_change()
-            return dict(state=state,results=results)
+            timings['publish_seconds'] = time.monotonic()-phase
+            timings['cpu_seconds'] = time.thread_time()-cpu_started
+            return dict(state=state,results=results,timings=timings)
 
     def apply(self, s, action, a, operator, when):
         def fail(message):
@@ -1193,7 +1224,7 @@ class Handler(BaseHTTPRequestHandler):
                 did = params.get('deviceId',[''])[0]
                 with self.server.store.changed:
                     seen = self.server.store.serial
-                initial_state = self.server.store.state()
+                initial_state = self.server.store.state(live=True)
                 self.send_response(200)
                 self.send_header('Content-Type','text/event-stream')
                 self.send_header('Cache-Control','no-cache, no-transform')
@@ -1213,7 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
                             seen = self.server.store.serial
                         self.server.store.touch_device(did)
                         if changed:
-                            initial_state = self.server.store.state()
+                            initial_state = self.server.store.state(live=True)
                             emit('state',initial_state)
                         else:
                             devices = copy.deepcopy(initial_state['devices'])
@@ -1224,7 +1255,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == '/api/state':
                 self.server.store.touch_device(params.get('deviceId',[''])[0])
-                self.respond(200, self.server.store.state())
+                self.respond(200, self.server.store.state(live=True))
             elif path == '/api/runs':
                 self.respond(200, self.server.store.runs())
             elif path == '/api/export':
@@ -1281,19 +1312,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(401, {'error':'Enter the team access code to connect.'})
                 return
             if self.path == '/api/device/hello':
-                self.respond(200, self.server.store.device_hello(req))
+                self.respond(200, self.server.store.device_hello(req, live=True))
                 return
             if self.path == '/api/actions':
                 started = time.monotonic()
-                result = self.server.store.commands(req.get('commands'))
+                result = self.server.store.commands(req.get('commands'), live=True)
                 self.log_message('Batch saved: actions=%d save_seconds=%.3f',
                                  len(result['results']), time.monotonic()-started)
+                self.log_message('Batch phases: %s', ' '.join(key+'='+format(value,'.3f') for key,value in result['timings'].items()))
                 self.respond(200, result)
                 return
             if self.path != '/api/action':
                 self.respond(404, {'error':'Not found.'})
                 return
-            self.respond(200, self.server.store.command(req))
+            self.respond(200, self.server.store.command(req, live=True))
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
             self.close_connection = True
         except RemoteDatabaseError:

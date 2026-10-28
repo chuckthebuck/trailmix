@@ -186,6 +186,7 @@ releaseLost();await lostFill;await settled();assert(run('outboxPaused'));assert.
 const lostId=run('outbox[0].request.requestId');context.fetch=realFetch;
 run("outbox=JSON.parse(localStorage.getItem(KEY+'-outbox'));outboxPaused=true;outboxRecovering=true;outboxBase=null;state=fresh();connected=false");
 await run('refresh(true)');assert(node('content').innerHTML.includes('held'));assert.equal(run('outbox[0].request.requestId'),lostId);
+assert.throws(()=>run("enqueueStationAction('label',{qty:1})"),/Confirm recovered saves/);
 await run('retryOutbox()');await settled();assert.equal(run('outbox.length'),0);assert(!run('outboxPaused'),run('outboxError'));
 assert.equal(run('state.bags.length'),beforeLost+1);assert.equal(run('state.bags[state.bags.length-1].status'),'inspectionTransit');
 assert.equal(run(`state.events.filter(e=>e.requestId==='${lostId}').length`),1);

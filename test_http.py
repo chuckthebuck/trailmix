@@ -63,8 +63,8 @@ class ResponseTests(unittest.TestCase):
         req = self.req('label', qty=3)
         req['queued'] = True
         commands = self.store.commands
-        def lost_confirmation(requests):
-            commands(requests)
+        def lost_confirmation(requests, **kwargs):
+            commands(requests, **kwargs)
             raise RuntimeError('Failure after commit')
         h = self.handler({'commands':[req]}, io.BytesIO())
         with patch.object(self.store, 'commands', side_effect=lost_confirmation):

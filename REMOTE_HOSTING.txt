@@ -136,3 +136,13 @@ JSON/CSV exports remain ordinary JSON/CSV with full audit history. Live API and
 SSE responses omit historical before/after bag copies, retaining activity
 metadata and current bag state. Batch save_seconds logs include database lock
 wait and command processing, excluding HTTP response transmission.
+
+
+Batch phase diagnostics
+Batch saved includes total save_seconds. Batch phases splits lock, read, decode,
+apply, encode, write, commit and publication elapsed seconds; cpu_seconds measures
+CPU consumed by that request thread and excludes waiting and other threads.
+These distinguish CPU work, lock waits and remote call phases. A remote-call
+phase includes network transfer/provider time and any parsing in the adapter;
+it is not the database's SQL execution time alone. Fully duplicate batches now
+use two remote trips and skip the snapshot update.

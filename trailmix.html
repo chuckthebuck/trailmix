@@ -541,7 +541,9 @@ function previewStationAction(s,e){
 }
 function enqueueStationAction(action,args){
  if(busy||pending)throw Error('Wait for the management save to finish.');
+ if(outboxRecovering)throw Error('Confirm recovered saves before recording more bags.');
  if(outboxPaused)throw Error('Resolve the held saves before continuing.');
+ if(['finish','finalFail','seal','failSeal','weigh','clear'].includes(action)&&outbox.some(entry=>entry.action===action&&entry.args.bag===args.bag))throw Error('This bag already has that action pending. Wait for confirmation.');
  if(!connected)throw Error('Server disconnected. Reconnect before continuing.');
  if(!storageOK)throw Error('Browser storage is unavailable; pending saves cannot be retained.');
  if(outbox.length>=200)throw Error('200 saves are pending. Wait for them to finish before continuing.');

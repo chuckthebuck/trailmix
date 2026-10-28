@@ -1,3 +1,45 @@
+Save-path CPU and retry update
+
+Server logs confirmed 7.258–14.302 seconds inside Store.commands, including
+roughly 8–9 seconds for one-action saves. A local profile of the captured large
+run found full audit-history deep copies consuming much of the processing time.
+
+HTTP state, SSE, device registration and action endpoints now request the live
+projection before making independent response copies. Successful HTTP actions
+publish the privately owned full state without deep-copying all historical bag
+snapshots again. Management actions copy only the pre-action bags and people
+needed for their audit event. Full Store.state and JSON/CSV exports retain the
+original complete audit behavior. Transactions, current-state reads and locks
+are still authoritative; this update introduces no speculative database writes.
+
+A fully duplicate batch now confirms original IDs without re-encoding or
+rewriting the run snapshot, using two database round trips. New and mixed
+batches retain atomic writes and three database round trips.
+
+Responses and logs include batch phase durations for lock acquisition, database
+read, decode, action application, encode, database write, commit and snapshot
+publication, plus thread CPU seconds. Batch saved still reports total elapsed
+save_seconds. Timings contain no credentials, operator names or bag contents.
+
+Recovered saves must be confirmed before recording more production actions.
+The same per-bag action cannot be enqueued repeatedly while already pending.
+This addresses the captured rejected batch of 16 finish actions for one bag.
+
+A local three-trial CPU comparison with captured run data measured median
+one-action save CPU from 0.5638 to 0.3408 seconds and cached state-read CPU from
+0.3907 to 0.1269 seconds. These are local CPU measurements, not live cloud
+response-time guarantees. Database transfer and hosting CPU contention still
+need the new phase logs to quantify.
+
+Deploy server.py and trailmix.html, refresh browsers, then use Retry saved
+entries to confirm retained actions. All prior fixes and packed snapshot
+compatibility apply. Old builds cannot read packed snapshots.
+
+Validation: 86 backend tests, keyboard checks and local HTTP/DOM workflow checks
+passed. New regressions check private cache isolation, audit preservation,
+no full audit copying on live paths, two-trip duplicate confirmation and the
+recovered-input guard. No live deployment or cloud stress test was performed.
+
 HAR-based performance update
 
 The supplied 20-request HAR contained 19 successful saves and one canceled
@@ -28,7 +70,7 @@ Compatibility: old server builds cannot read the new packed remote snapshots.
 Keep this server.py or a newer compatible version when redeploying. JSON exports
 remain ordinary complete JSON. Audit rows are still append-only.
 
-Validation: 84 backend tests plus keyboard and local HTTP/DOM workflow checks
+Validation: 86 backend tests plus keyboard and local HTTP/DOM workflow checks
 passed, including large lossless snapshots, legacy reads/upgrade/restart,
 archives, live-response projection, complete audit exports and lost-commit
 retries. Live Render/Turso latency has not been measured with this version.
@@ -64,7 +106,7 @@ slow saves without changing transaction speed or batching limits.
 
 Regression checks simulate disconnects before headers and during the response,
 verify committed batches retry exactly once, and exercise unexpected failures
-after commit. All 84 backend tests, keyboard checks and the local HTTP/DOM
+after commit. All 86 backend tests, keyboard checks and the local HTTP/DOM
 production workflow passed. Live hosting stress latency was not measured here.
 
 Direct rework to Sealing, saved configurations and station-page assignment
@@ -92,7 +134,7 @@ including station mode. Choose a person and optionally replace the existing
 assignment or also assign this device. Delivery pages include a leg selector.
 Assignments are logged and unfinished weight entry is preserved.
 
-Validation: 84 backend tests plus keyboard and local HTTP workflows passed,
+Validation: 86 backend tests plus keyboard and local HTTP workflows passed,
 including direct rework, shared mixed-origin packages, named configuration
 reloads, new-run resets, coordinator assignments, saved remote setups and retries.
 Live cloud deployment and full-browser visual rendering were not tested here.
