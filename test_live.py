@@ -149,6 +149,23 @@ class LiveTests(unittest.TestCase):
             self.store.command(self.command(1))
             self.assertTrue(self.server.stream_done.wait(3),'Stream did not stop after disconnect')
 
+    def test_live_state_and_batch_omit_snapshots_but_json_export_is_complete(self):
+        self.server.require_access_code = False
+        request = self.command(2)
+        request['queued'] = True
+        status, _, response = self.request('POST','/api/actions',{'commands':[request]})
+        self.assertEqual(status,200)
+        self.assertNotIn('before',response['state']['events'][0])
+        self.assertNotIn('after',response['results'][0]['event'])
+        status, _, live = self.request('GET','/api/state')
+        self.assertEqual(status,200)
+        self.assertNotIn('after',live['events'][0])
+        status, _, exported = self.request('GET','/api/export?kind=json')
+        self.assertEqual(status,200)
+        self.assertIn('before',exported['events'][0])
+        self.assertIn('after',exported['events'][0])
+        self.assertEqual(exported['events'],self.store.state()['events'])
+
 
 if __name__ == '__main__':
     unittest.main()

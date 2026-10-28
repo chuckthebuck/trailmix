@@ -1,3 +1,72 @@
+HAR-based performance update
+
+The supplied 20-request HAR contained 19 successful saves and one canceled
+request at 10.006 seconds. Median successful time waiting for the response was
+8.269 seconds; median response download was 0.160 seconds. Requests already
+batched up to 50 actions. Large current-run snapshots were read and rewritten on
+every save; historical bag snapshots also appeared in every live response.
+
+Remote database run snapshots now use lossless, versioned compression. Existing
+plain JSON reads normally and is packed on the next successful write. No manual
+migration or clearing of inventory is required. Local SQLite stays plain JSON.
+Station API responses and SSE omit historical event before/after bag copies;
+current bags, complete activity entries and event metadata remain available.
+Full before/after snapshots remain in database event history and JSON/CSV exports.
+
+Using the HAR's last successful response as input, database snapshot encoding
+shrunk from 8,490,607 to 1,088,802 bytes, and live JSON response size fell from
+8,542,844 to 2,721,457 bytes (before HTTP compression). Encoding took about 71 ms
+in the local sample and decoding returned the exact original state. This is a
+payload-size comparison, not a measured live-hosting latency improvement.
+
+Deploy server.py and trailmix.html, then refresh station browsers. The 60-second
+POST timeout, duplicate-safe saved-entry retries, disconnect cleanup, HEAD
+support and batch save-duration logging are included. The first save still has
+to read the old large snapshot; later saves use the packed format.
+
+Compatibility: old server builds cannot read the new packed remote snapshots.
+Keep this server.py or a newer compatible version when redeploying. JSON exports
+remain ordinary complete JSON. Audit rows are still append-only.
+
+Validation: 84 backend tests plus keyboard and local HTTP/DOM workflow checks
+passed, including large lossless snapshots, legacy reads/upgrade/restart,
+archives, live-response projection, complete audit exports and lost-commit
+retries. Live Render/Turso latency has not been measured with this version.
+
+Additional stress-log fixes
+
+The supplied log revealed a disconnect during the initial live-update (SSE)
+handshake. Disconnect handling now covers stream headers, the retry preamble,
+the initial state and later updates. HEAD / and HEAD /index.html return page
+headers with no body, supporting hosting probes without the previous 501.
+
+Successful /api/actions batches now log actions=N and save_seconds=N.NNN.
+This includes time waiting for the database lock and command processing, but
+excludes sending the HTTP response. Response log intervals alone do not measure
+request latency; use these timings during the next stress test.
+
+Deploy server.py and trailmix.html, refresh browsers, and retry retained entries
+using their original IDs. All earlier disconnect and timeout fixes are included.
+
+Stress-test disconnect fix
+
+Deploy server.py and trailmix.html, then refresh station browsers. Retained
+pending entries should use Retry saved entries, preserving the original action
+IDs. Do not repeat physical actions because confirmation was lost.
+
+HTTP disconnects while sending headers or body now close the connection without
+a second response or a misleading save-failed traceback. A batch may have
+committed before its response was lost. Unexpected server errors now report an
+unconfirmed save and allow retrying the same request IDs instead of claiming
+that nothing committed. POST requests wait up to 60 seconds for confirmation
+(previously 10); read requests retain their 10-second timeout. This accommodates
+slow saves without changing transaction speed or batching limits.
+
+Regression checks simulate disconnects before headers and during the response,
+verify committed batches retry exactly once, and exercise unexpected failures
+after commit. All 84 backend tests, keyboard checks and the local HTTP/DOM
+production workflow passed. Live hosting stress latency was not measured here.
+
 Direct rework to Sealing, saved configurations and station-page assignment
 
 Let pending saves finish. Deploy server.py, turso_db.py and trailmix.html
@@ -23,7 +92,7 @@ including station mode. Choose a person and optionally replace the existing
 assignment or also assign this device. Delivery pages include a leg selector.
 Assignments are logged and unfinished weight entry is preserved.
 
-Validation: 75 backend tests plus keyboard and local HTTP workflows passed,
+Validation: 84 backend tests plus keyboard and local HTTP workflows passed,
 including direct rework, shared mixed-origin packages, named configuration
 reloads, new-run resets, coordinator assignments, saved remote setups and retries.
 Live cloud deployment and full-browser visual rendering were not tested here.

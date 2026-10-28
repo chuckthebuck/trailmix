@@ -125,3 +125,14 @@ TRAILMIX_REQUIRE_ACCESS_CODE=1 only if you want optional team-code sign-in.
 Set TRAILMIX_SAFETY_PIN to the current Safety PIN before updating to preserve
 that exact value. The PIN is saved in Turso and remains consistent after
 restarts. Without an explicit PIN, one is generated once and saved.
+
+
+Run snapshot storage (HAR performance update)
+Remote run snapshots use a versioned lossless compressed JSON envelope to
+reduce reads/writes. Prior plain JSON is accepted and packs on a later save.
+Use this server.py or a newer compatible build for subsequent deployments;
+older builds cannot decode the packed snapshot format. Local SQLite and all
+JSON/CSV exports remain ordinary JSON/CSV with full audit history. Live API and
+SSE responses omit historical before/after bag copies, retaining activity
+metadata and current bag state. Batch save_seconds logs include database lock
+wait and command processing, excluding HTTP response transmission.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """TrailMix: browser stations, SQLite persistence, append-only production records."""
 import argparse
+import base64
 import copy
 import csv
 import hashlib
@@ -15,6 +16,7 @@ import sqlite3
 import time
 import threading
 import uuid
+import zlib
 from contextlib import contextmanager
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -98,7 +100,7 @@ class Store:
                 db.execute("INSERT INTO meta(key,value) VALUES ('auth_cookie',?)", (self.auth_cookie,))
             if not db.execute("SELECT value FROM meta WHERE key='current'").fetchone():
                 s = fresh()
-                db.execute('INSERT INTO runs(id,state) VALUES (?,?)', (s['runId'], json.dumps(s)))
+                db.execute('INSERT INTO runs(id,state) VALUES (?,?)', (s['runId'], self.encode_state(s)))
                 db.execute("INSERT INTO meta VALUES ('current',?)", (s['runId'],))
 
     @contextmanager
@@ -128,11 +130,22 @@ class Store:
             return db.execute_group(statements)
         return [db.execute(sql, parameters) for sql, parameters in statements]
 
+    def encode_state(self, state):
+        raw = json.dumps(state, separators=(',', ':'))
+        if not self.turso_url:
+            return raw
+        # Keep the whole audit history, but avoid transferring megabytes of
+        # repeated bag snapshots to/from the database for every station save.
+        packed = base64.b64encode(zlib.compress(raw.encode(), 1)).decode('ascii')
+        return json.dumps({'trailmixStorage':'zlib-v1', 'payload':packed}, separators=(',', ':'))
+
     @staticmethod
     def decode_state(row):
         if not row:
             raise Problem('Run not found.')
         state = json.loads(row[0])
+        if state.get('trailmixStorage') == 'zlib-v1':
+            state = json.loads(zlib.decompress(base64.b64decode(state['payload'], validate=True)))
         # Existing databases need no manual conversion; records remain intact.
         state.setdefault('people', [])
         state.setdefault('messages', [])
@@ -202,7 +215,7 @@ class Store:
         with self.connect() as db:
             rows = db.execute('SELECT state,archived FROM runs ORDER BY rowid DESC').fetchall()
         return [dict(id=s['runId'], name=s['batch'], started=s['started'], archived=bool(a),
-                     bags=len(s['bags']), events=len(s['events'])) for raw, a in rows for s in [json.loads(raw)]]
+                     bags=len(s['bags']), events=len(s['events'])) for raw, a in rows for s in [self.decode_state((raw,))]]
 
     def command(self, req):
         # Keep commit, snapshot publication, and change notification in order.
@@ -301,11 +314,11 @@ class Store:
             writes = [
                 ('INSERT INTO events(id,run_id,at,operator,action,payload,result) VALUES (?,?,?,?,?,?,?)',
                  (event['id'], s['runId'], when, operator, action, json.dumps(payload), json.dumps(event))),
-                ('UPDATE runs SET state=? WHERE id=?', (json.dumps(s), s['runId']))]
+                ('UPDATE runs SET state=? WHERE id=?', (self.encode_state(s), s['runId']))]
             if action == 'newRun':
                 writes.extend([
                     ('UPDATE runs SET archived=1 WHERE id=?', (s['runId'],)),
-                    ('INSERT INTO runs(id,state) VALUES (?,?)', (new['runId'], json.dumps(new))),
+                    ('INSERT INTO runs(id,state) VALUES (?,?)', (new['runId'], self.encode_state(new))),
                     ("UPDATE meta SET value=? WHERE key='current'", (new['runId'],))])
                 s = new
             writes.append(('INSERT INTO requests VALUES (?,?,?)', (request_id, digest, old['runId'])))
@@ -437,7 +450,7 @@ class Store:
                         remap['pending-'+rid] = (event['bags'][0] if action=='fill' else event['changes']['movementId'] if action=='labelPickup' else event['changes']['deliveryIds'][0])
                         if action=='routePickup' and event['changes'].get('movementId') is not None:
                             remap['pending-move-'+rid] = event['changes']['movementId']
-                writes.append(('UPDATE runs SET state=? WHERE id=?',(json.dumps(state),state['runId'])))
+                writes.append(('UPDATE runs SET state=? WHERE id=?',(self.encode_state(state),state['runId'])))
                 self.execute_group(db,writes)
             self.cached_current = copy.deepcopy(state)
             self.attach_presence(state)
@@ -1086,6 +1099,31 @@ class Store:
         return 'text/csv; charset=utf-8', out.getvalue().encode('utf-8-sig')
 
 
+def live_event(event):
+    if event is None:
+        return None
+    return {key:value for key,value in event.items() if key not in ('before', 'after')}
+
+
+def live_state(state):
+    return dict(state, events=[live_event(event) for event in state['events']])
+
+
+def live_response(body):
+    if not isinstance(body, dict):
+        return body
+    if 'runId' in body and 'events' in body:
+        return live_state(body)
+    if 'state' not in body:
+        return body
+    result = dict(body, state=live_state(body['state']))
+    if 'event' in body:
+        result['event'] = live_event(body['event'])
+    if 'results' in body:
+        result['results'] = [dict(item, event=live_event(item.get('event'))) for item in body['results']]
+    return result
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'TrailMix/1.0'
     protocol_version = 'HTTP/1.1'
@@ -1096,23 +1134,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def respond(self, code, body, content='application/json', cookie=None, filename=None):
         if isinstance(body, (dict, list)):
-            body = json.dumps(body).encode()
+            body = json.dumps(live_response(body), separators=(',', ':')).encode()
         if isinstance(body, str):
             body = body.encode()
-        self.send_response(code)
-        self.send_header('Content-Type', content)
-        self.send_header('Content-Length', str(len(body)))
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('X-Frame-Options', 'DENY')
-        self.send_header('Referrer-Policy', 'same-origin')
-        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'")
-        if cookie:
-            self.send_header('Set-Cookie', cookie)
-        if filename:
-            self.send_header('Content-Disposition', 'attachment; filename="'+filename+'"')
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', content)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('X-Frame-Options', 'DENY')
+            self.send_header('Referrer-Policy', 'same-origin')
+            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'")
+            if cookie:
+                self.send_header('Set-Cookie', cookie)
+            if filename:
+                self.send_header('Content-Disposition', 'attachment; filename="'+filename+'"')
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+            # A command may already be committed. A disconnected response must
+            # never become a save failure or trigger a second HTTP response.
+            self.close_connection = True
+
 
     def authorized(self):
         if not getattr(self.server, 'require_access_code', False):
@@ -1124,6 +1169,13 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
         return hmac.compare_digest(token, self.server.auth_cookie)
+
+    def do_HEAD(self):
+        # Hosting probes only need the page headers; never open an SSE stream.
+        if urlparse(self.path).path in ('/', '/index.html'):
+            self.respond(200, (ROOT/'trailmix.html').read_bytes(), 'text/html; charset=utf-8')
+        else:
+            self.respond(404, {'error':'Not found.'})
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -1150,7 +1202,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'retry: 10000\n\n')
                 def emit(kind, data):
-                    self.wfile.write(('event: '+kind+'\ndata: '+json.dumps(data)+'\n\n').encode())
+                    self.wfile.write(('event: '+kind+'\ndata: '+json.dumps(live_response(data), separators=(',', ':'))+'\n\n').encode())
                     self.wfile.flush()
                 try:
                     self.server.store.touch_device(did)
@@ -1167,8 +1219,8 @@ class Handler(BaseHTTPRequestHandler):
                             devices = copy.deepcopy(initial_state['devices'])
                             self.server.store.attach_presence({'devices':devices})
                             emit('ping',dict(at=NOW(), devices=devices))
-                except (BrokenPipeError,ConnectionResetError,TimeoutError,RemoteDatabaseError):
-                    pass
+                except (BrokenPipeError,ConnectionResetError,ConnectionAbortedError,TimeoutError,RemoteDatabaseError):
+                    self.close_connection = True
                 return
             if path == '/api/state':
                 self.server.store.touch_device(params.get('deviceId',[''])[0])
@@ -1181,6 +1233,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, data, mime, filename='trailmix-'+kind+('.json' if kind=='json' else '.csv'))
             else:
                 self.respond(404, {'error':'Not found.'})
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+            self.close_connection = True
         except RemoteDatabaseError:
             self.respond(503, {'error':'Database unavailable. Reconnect or retry the same save.', 'retryable':True})
         except Problem as e:
@@ -1230,12 +1284,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, self.server.store.device_hello(req))
                 return
             if self.path == '/api/actions':
-                self.respond(200, self.server.store.commands(req.get('commands')))
+                started = time.monotonic()
+                result = self.server.store.commands(req.get('commands'))
+                self.log_message('Batch saved: actions=%d save_seconds=%.3f',
+                                 len(result['results']), time.monotonic()-started)
+                self.respond(200, result)
                 return
             if self.path != '/api/action':
                 self.respond(404, {'error':'Not found.'})
                 return
             self.respond(200, self.server.store.command(req))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+            self.close_connection = True
         except RemoteDatabaseError:
             self.respond(503, {'error':'Database unavailable or save not confirmed. Retry the same save.', 'retryable':True})
         except (Problem, ValueError, TypeError) as e:
@@ -1243,7 +1303,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             import traceback
             traceback.print_exc()
-            self.respond(500, {'error':'Server could not save the action. No partial update was committed.'})
+            self.respond(500, {'error':'Save not confirmed. Retry the same save; do not repeat physical actions.', 'retryable':True})
 
 
 def main():

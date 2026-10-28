@@ -247,3 +247,23 @@ class TursoTests(unittest.TestCase):
             with self.assertRaises(ValueError): TursoConnection(url,'token')
         for value in (None,2**60,2.1,'word',b'bytes'):
             self.assertEqual(decode(encode(value)),value)
+
+    def test_legacy_snapshot_packs_on_next_save_and_retains_complete_audit(self):
+        self.stocked(1)
+        state = self.act('fill',station=1)
+        with self.store.connect() as db:
+            # Simulate a database written by the previous plain-JSON server.
+            db.execute('UPDATE runs SET state=? WHERE id=?',(json.dumps(state),state['runId']))
+        self.store = self.reopen()
+        self.assertEqual(self.store.state()['bags'],state['bags'])
+        request = self.req('note',note='After legacy snapshot migration')
+        self.store.command(request)
+        with self.store.connect() as db:
+            stored = db.execute('SELECT state FROM runs WHERE id=?',(state['runId'],)).fetchone()[0]
+        self.assertEqual(json.loads(stored)['trailmixStorage'],'zlib-v1')
+        self.store = self.reopen()
+        self.assertEqual(self.store.state()['events'][:-1],state['events'])
+        self.assertTrue(self.store.command(request)['duplicate'])
+        exported = json.loads(self.store.export('json')[1])
+        self.assertEqual(exported['events'][:-1],state['events'])
+        self.assertEqual(exported['events'][-2]['after'][0]['id'],state['bags'][0]['id'])
